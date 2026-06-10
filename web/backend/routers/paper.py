@@ -28,7 +28,9 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from .. import database as db
-from ..models import PaperOrderRequest, PaperOrderFromDecision, PaperAccountReset
+from ..models import (
+    PaperOrderRequest, PaperOrderFromDecision, PaperAccountReset, PaperCapitalAdjust,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +515,20 @@ async def reset(req: PaperAccountReset):
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     updated = await loop.run_in_executor(
         None, db.reset_paper_account, acct["id"], req.initial_cash)
+    return updated
+
+
+@router.post("/account/adjust")
+async def adjust_capital(req: PaperCapitalAdjust):
+    """Inject / withdraw capital without wiping positions (safe '加钱')."""
+    if not req.delta:
+        raise HTTPException(status_code=400, detail="delta 不能为 0")
+    loop = asyncio.get_running_loop()
+    acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
+    updated, err = await loop.run_in_executor(
+        None, db.adjust_paper_capital, acct["id"], float(req.delta))
+    if err:
+        raise HTTPException(status_code=400, detail=err)
     return updated
 
 

@@ -5,6 +5,7 @@
         <n-space>
           <n-button @click="takeSnapshot" :loading="snapshotting">{{ t('paper.snapshotBtn') }}</n-button>
           <n-button type="primary" @click="openOrder">{{ t('paper.manualOrder') }}</n-button>
+          <n-button type="success" ghost @click="openAdjust">{{ t('paper.addCapital') }}</n-button>
           <n-button type="error" ghost @click="confirmReset">{{ t('paper.resetAccount') }}</n-button>
         </n-space>
       </template>
@@ -173,12 +174,36 @@
             {{ amt >= 10000 ? (amt / 10000) + '万' : amt }}
           </n-button>
         </n-space>
-        <n-alert type="warning" :show-icon="false">{{ t('paper.resetContent') }}</n-alert>
+        <n-alert type="error" :show-icon="false">{{ t('paper.resetContent') }}</n-alert>
+        <n-text depth="3" style="font-size: 12px">{{ t('paper.resetHint') }}</n-text>
       </n-space>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showReset = false">{{ t('common.cancel') }}</n-button>
           <n-button type="error" :loading="resetting" @click="doReset">{{ t('paper.resetConfirm') }}</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- Inject / withdraw capital WITHOUT touching positions (safe 加钱) -->
+    <n-modal v-model:show="showAdjust" preset="card" :title="t('paper.addCapitalTitle')" style="width: 440px">
+      <n-space vertical :size="14">
+        <n-text depth="3" style="font-size: 13px">{{ t('paper.addCapitalDesc') }}</n-text>
+        <n-form-item :label="t('paper.addCapitalLabel')" label-placement="top">
+          <n-input-number v-model:value="adjustAmount" :step="1000" style="width: 100%">
+            <template #prefix>¥</template>
+          </n-input-number>
+        </n-form-item>
+        <n-space :size="8">
+          <n-button v-for="amt in [10000, 50000, 100000]" :key="amt" size="small"
+            @click="adjustAmount = amt">+{{ amt >= 10000 ? (amt / 10000) + '万' : amt }}</n-button>
+        </n-space>
+        <n-alert type="success" :show-icon="false" style="font-size: 12px">{{ t('paper.addCapitalNote') }}</n-alert>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showAdjust = false">{{ t('common.cancel') }}</n-button>
+          <n-button type="success" :loading="adjusting" @click="doAdjust">{{ t('common.submit') }}</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -227,6 +252,9 @@ interface PaperPosition {
   market_value: number | null
   pnl_amount: number | null
   pnl_pct: number | null
+  last_buy_source: string | null
+  source_analysis_id: string | null
+  last_buy_at: string | null
 }
 interface PaperOrder {
   id: number
@@ -420,6 +448,28 @@ const positionColumns = computed(() => [
     },
   },
   {
+    title: t('paper.posCols.source'),
+    key: 'source',
+    width: 130,
+    render(r: PaperPosition) {
+      // Mirror the Orders table's source cell: auto / decision link back to the
+      // triggering analysis report; manual / screen are plain labels.
+      const src = r.last_buy_source
+      if ((src === 'decision' || src === 'auto') && r.source_analysis_id) {
+        const label = src === 'auto' ? t('paper.source.auto') : t('paper.source.decision')
+        const title = r.last_buy_at ? r.last_buy_at.replace('T', ' ').slice(0, 19) : undefined
+        return h('a', {
+          style: { color: src === 'auto' ? '#d09030' : '#3060d0', cursor: 'pointer' },
+          title,
+          onClick: () => router.push(`/report/${r.source_analysis_id}`),
+        }, label)
+      }
+      if (src === 'screen') return t('paper.source.screen')
+      if (src === 'manual') return t('paper.source.manual')
+      return '—'
+    },
+  },
+  {
     title: t('paper.posCols.actions'),
     key: 'actions',
     width: 220,
@@ -604,6 +654,34 @@ async function takeSnapshot() {
     message.error(t('paper.msg.snapshotFailed') + (e?.response?.data?.detail || e?.message || t('common.unknownError')))
   } finally {
     snapshotting.value = false
+  }
+}
+
+// Inject capital without wiping positions — the safe alternative to reset.
+const showAdjust = ref(false)
+const adjusting = ref(false)
+const adjustAmount = ref<number | null>(10000)
+
+function openAdjust() {
+  adjustAmount.value = 10000
+  showAdjust.value = true
+}
+
+async function doAdjust() {
+  if (!adjustAmount.value) {
+    message.warning(t('paper.addCapitalValidation'))
+    return
+  }
+  adjusting.value = true
+  try {
+    await api.post('/api/paper/account/adjust', { delta: adjustAmount.value })
+    showAdjust.value = false
+    message.success(t('paper.msg.capitalAdjusted'))
+    await loadAll()
+  } catch (e: any) {
+    message.error(t('paper.msg.capitalFailed') + (e?.response?.data?.detail || e?.message || t('common.unknownError')))
+  } finally {
+    adjusting.value = false
   }
 }
 

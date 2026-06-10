@@ -168,6 +168,13 @@ class PaperAccountReset(BaseModel):
     initial_cash: Optional[float] = None
 
 
+class PaperCapitalAdjust(BaseModel):
+    # Amount to inject (positive) or withdraw (negative). Adjusts cash AND
+    # initial_cash together, leaving positions/orders untouched — the safe
+    # "加钱" alternative to a full reset.
+    delta: float
+
+
 class ScreenRequest(BaseModel):
     """Start a stock-screening ("选股") run.
 

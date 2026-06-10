@@ -50,6 +50,7 @@ export default {
     switchLanguage: 'Switch language',
     languageZh: '中文',
     languageEn: 'English',
+    starting: 'Starting up…',
   },
 
   menu: {
@@ -440,6 +441,12 @@ export default {
     subtitle: 'Virtual account / one-click order from decisions / NAV curve',
     snapshotBtn: 'Snapshot NAV',
     manualOrder: 'Manual order',
+    addCapital: 'Add funds',
+    addCapitalTitle: 'Add funds / adjust capital',
+    addCapitalDesc: 'Increase (or decrease) account capital and available cash. Positions and orders are all kept. Use this to add money — not Reset.',
+    addCapitalLabel: 'Amount (negative to withdraw)',
+    addCapitalNote: 'Capital and cash move together so the P&L baseline stays consistent — adding money is not counted as profit.',
+    addCapitalValidation: 'Enter an amount',
     resetAccount: 'Reset account',
     warning: 'Paper trading is for evaluating "what if we acted on the agent\'s decisions" — orders fill instantly at the specified price, with no slippage/fees/price-limits modeled. Any inferred P&L is NOT investment advice.',
     stats: {
@@ -486,6 +493,8 @@ export default {
       snapshotFailed: 'Snapshot failed: ',
       reset: 'Account reset',
       resetFailed: 'Reset failed: ',
+      capitalAdjusted: 'Capital adjusted',
+      capitalFailed: 'Add funds failed: ',
     },
     flattenTitle: 'Flatten position',
     flattenContent: 'Sell all {shares} shares of {ticker} at current price?',
@@ -506,7 +515,8 @@ export default {
     },
     orderValidation: 'Please fill ticker and share count',
     resetTitle: 'Reset account / set capital',
-    resetContent: 'Clears all positions, orders and NAV snapshots, and resets available cash to the starting capital set below. This cannot be undone.',
+    resetContent: '⚠️ Clears all positions, orders and NAV snapshots, and resets available cash to the starting capital set below. This cannot be undone!',
+    resetHint: 'Just want to add money? Close this and use the “Add funds” button top-right — it keeps your positions.',
     resetConfirm: 'Confirm reset',
     resetCashLabel: 'Starting capital (available cash)',
     posCols: {
@@ -516,6 +526,7 @@ export default {
       last: 'Last',
       marketValue: 'Mkt value',
       pnl: 'P&L',
+      source: 'Source',
       actions: 'Actions',
     },
     posBtn: {
@@ -773,6 +784,7 @@ export default {
     dirCache: 'Cache dir',
     dirResults: 'Results dir',
     dirMemory: 'Memory log',
+    dbBackend: 'Database',
     saveBtn: 'Save settings',
     saved: 'Settings saved',
   },

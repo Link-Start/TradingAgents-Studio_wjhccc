@@ -50,6 +50,7 @@ export default {
     switchLanguage: '切换语言',
     languageZh: '中文',
     languageEn: 'English',
+    starting: '服务启动中…',
   },
 
   menu: {
@@ -440,6 +441,12 @@ export default {
     subtitle: '虚拟账户 / 按决策一键下单 / 净值曲线追踪',
     snapshotBtn: '记录净值快照',
     manualOrder: '手动下单',
+    addCapital: '注资',
+    addCapitalTitle: '注资 / 调整本金',
+    addCapitalDesc: '增加（或减少）账户本金与可用现金,持仓和订单全部保留。想加钱请用这里,不要用「重置」。',
+    addCapitalLabel: '注资金额(可负数表示提取)',
+    addCapitalNote: '本金与可用现金同时调整,盈亏基准保持一致 — 加钱不会被算成盈利。',
+    addCapitalValidation: '请输入注资金额',
     resetAccount: '重置账户',
     warning: '模拟交易仅用于评估"如果按 Agent 给出的决策操作"会发生什么 — 订单按指定价格瞬时成交,不模拟滑点/手续费/涨跌停。任何由此推断出的盈亏均不构成投资建议。',
     stats: {
@@ -486,6 +493,8 @@ export default {
       snapshotFailed: '记录失败：',
       reset: '账户已重置',
       resetFailed: '重置失败：',
+      capitalAdjusted: '本金已调整',
+      capitalFailed: '注资失败：',
     },
     flattenTitle: '一键平仓',
     flattenContent: '按当前现价卖出全部 {shares} 股 {ticker}?',
@@ -506,7 +515,8 @@ export default {
     },
     orderValidation: '请填写代码与数量',
     resetTitle: '重置账户 / 设置本金',
-    resetContent: '将清空所有持仓、订单与净值快照，并把可用资金重置为下方设置的本金。该操作不可撤销。',
+    resetContent: '⚠️ 会清空所有持仓、订单与净值快照,并把可用资金重置为下方设置的本金。该操作不可撤销!',
+    resetHint: '只是想加钱?请关掉这里,改用右上角的「注资」按钮 — 它保留你的持仓。',
     resetConfirm: '确认重置',
     resetCashLabel: '初始本金（可用资金）',
     posCols: {
@@ -516,6 +526,7 @@ export default {
       last: '现价',
       marketValue: '市值',
       pnl: '盈亏',
+      source: '来源',
       actions: '操作',
     },
     posBtn: {
@@ -773,6 +784,7 @@ export default {
     dirCache: '缓存目录',
     dirResults: '结果目录',
     dirMemory: '内存日志',
+    dbBackend: '数据库',
     saveBtn: '保存设置',
     saved: '设置已保存',
   },
