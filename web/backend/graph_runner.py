@@ -345,10 +345,20 @@ def _extract_confidence(signal: str) -> Optional[float]:
 
 
 def _extract_signal_direction(signal: str) -> str:
+    """Collapse the PM's 5-tier rating into the 3-tier BUY/SELL/HOLD the UI uses.
+
+    ``signal`` is the rating string from ``SignalProcessor.process_signal`` —
+    one of Buy / Overweight / Hold / Underweight / Sell (see
+    ``tradingagents.agents.utils.rating``). We must recognise the *whole*
+    5-tier vocabulary: "Overweight" is a buy and "Underweight" is a sell.
+    Missing them silently mislabels an Overweight decision as HOLD on the
+    history page even though auto-trade (which reads the rating directly)
+    correctly buys. BULLISH/BEARISH are kept for any legacy 3-tier callers.
+    """
     upper = signal.upper() if signal else ""
-    if "BUY" in upper or "BULLISH" in upper:
+    if "BUY" in upper or "OVERWEIGHT" in upper or "BULLISH" in upper:
         return "BUY"
-    if "SELL" in upper or "BEARISH" in upper:
+    if "SELL" in upper or "UNDERWEIGHT" in upper or "BEARISH" in upper:
         return "SELL"
     return "HOLD"
 
