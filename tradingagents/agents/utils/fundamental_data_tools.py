@@ -6,7 +6,7 @@ from tradingagents.dataflows.interface import route_to_vendor
 @tool
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol"],
-    curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"],
+    curr_date: Annotated[str, "current date you are trading at, yyyy-mm-dd"] = None,
 ) -> str:
     """
     Retrieve comprehensive fundamental data for a given ticker symbol.
@@ -17,6 +17,14 @@ def get_fundamentals(
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
+    # The LLM occasionally calls this tool without curr_date. Previously that was
+    # a *required* arg, so the omission raised a pydantic validation error that
+    # aborted the entire analysis ("Field required"). Default to today (matching
+    # the lenient get_balance_sheet/get_cashflow/get_income_statement siblings)
+    # so a forgetful tool call degrades to current-date data instead of failing.
+    if not curr_date:
+        from datetime import datetime
+        curr_date = datetime.now().strftime("%Y-%m-%d")
     return route_to_vendor("get_fundamentals", ticker, curr_date)
 
 
