@@ -1,5 +1,5 @@
 <template>
-  <div ref="wrapEl" class="k-line-wrap" :class="{ 'is-fullscreen': isFullscreen }">
+  <div class="k-line-wrap" :class="{ 'is-fullscreen': isFullscreen }">
     <div class="k-line-toolbar">
       <n-space size="small" align="center" :wrap-item="false" wrap>
         <n-radio-group v-model:value="interval" size="small" @update:value="onIntervalChange">
@@ -58,7 +58,6 @@ const props = defineProps<{
 }>()
 
 const chartEl = ref<HTMLDivElement | null>(null)
-const wrapEl = ref<HTMLDivElement | null>(null)
 const interval = ref<'1min' | '5min' | '15min' | '30min' | '60min' | 'daily'>('daily')
 const lookback = ref(60)
 const loading = ref(false)
@@ -94,7 +93,7 @@ function createChart() {
         upBorderColor: upColor, downBorderColor: downColor,
         upWickColor: upColor, downWickColor: downColor,
       },
-      tooltip: { showRule: 'always' },
+      tooltip: { showRule: 'always' as any },
     },
     indicator: {
       lines: [
@@ -258,7 +257,7 @@ function addPriceLines() {
         id,
         name: 'horizontalStraightLine',
         points: [{ value: price }],
-        styles: { line: { color, style: 'dashed', size: 1 } },
+        styles: { line: { color, style: 'dashed' as any, size: 1 } },
       })
     } catch {
       // Older klinecharts builds may not have this overlay; non-essential.

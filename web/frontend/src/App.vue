@@ -4,7 +4,7 @@
       <n-message-provider>
         <n-dialog-provider>
           <n-layout has-sider style="height: 100vh">
-            <n-layout-sider bordered :width="220" :collapsed-width="64" show-trigger collapse-mode="width" :collapsed="collapsed" @update:collapsed="v => collapsed = v">
+            <n-layout-sider bordered :width="220" :collapsed-width="64" show-trigger collapse-mode="width" :collapsed="collapsed" @update:collapsed="(v: boolean) => collapsed = v">
               <div class="brand">
                 <img v-if="!collapsed" src="/logo.svg" alt="TradingAgents-Studio" class="brand-logo-full" />
                 <img v-else src="/favicon.svg" alt="TA" class="brand-logo-mark" />

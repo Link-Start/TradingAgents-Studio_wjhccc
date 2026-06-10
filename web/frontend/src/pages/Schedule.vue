@@ -251,7 +251,7 @@ const columns = computed(() => [
       }
       if (r.status === 'active') {
         buttons.push(h(NButton, { size: 'tiny', onClick: () => setStatus(r, 'paused') }, () => t('schedule.btn.pause')))
-      } else if (r.status !== 'active') {
+      } else {
         buttons.push(h(NButton, { size: 'tiny', onClick: () => setStatus(r, 'active') }, () => t('schedule.btn.enable')))
       }
       buttons.push(h(NButton, { size: 'tiny', type: 'error', onClick: () => confirmDelete(r) }, () => t('schedule.btn.delete')))
