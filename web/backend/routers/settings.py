@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from tradingagents.default_config import DEFAULT_CONFIG, _ENV_OVERRIDES
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
+from .. import database as db
 from ..models import SettingsUpdate, APIKeysUpdate
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -47,6 +48,9 @@ async def get_settings():
         "data_cache_dir": config.get("data_cache_dir"),
         "results_dir": config.get("results_dir"),
         "memory_log_path": config.get("memory_log_path"),
+        # Read-only: which DB backend is active (sqlite / mysql / …). Switching
+        # is done via TRADINGAGENTS_DB_URL in .env + restart, not from the UI.
+        "db_backend": db.current_backend(),
     }
 
 

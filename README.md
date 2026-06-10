@@ -431,10 +431,23 @@ at `~/.tradingagents/cache/checkpoints/<TICKER>.db`.
 
 ### Web state
 
-The Web Studio's SQLite (runs, holdings, schedules, paper account, backtests)
-lives at `~/.tradingagents/web_state.db`. Override with `TRADINGAGENTS_WEB_DB`.
-**It is recreated automatically on startup if missing** — deleting it just
-gives you a clean slate. API keys live in `.env`, not in this database.
+The Web Studio's database (runs, holdings, schedules, paper account, backtests)
+defaults to SQLite at `~/.tradingagents/web_state.db` (override the file path
+with `TRADINGAGENTS_WEB_DB`). **Tables are created automatically on first run if
+missing; existing data is never dropped.** API keys live in `.env`, not here.
+
+**Using MySQL (or another SQLAlchemy backend) instead of SQLite.** Set
+`TRADINGAGENTS_DB_URL` in `.env` to a SQLAlchemy URL and restart — e.g.
+`TRADINGAGENTS_DB_URL=mysql+pymysql://user:pass@host:3306/tradingagents?charset=utf8mb4`.
+When unset, the legacy SQLite file is used (zero-config, fully backward
+compatible). The active backend is shown read-only on the Settings page. To copy
+your existing SQLite history into the new database (idempotent, non-destructive):
+
+```bash
+python -m web.backend.migrate_db \
+  --source sqlite:///~/.tradingagents/web_state.db \
+  --target "$TRADINGAGENTS_DB_URL"
+```
 
 ---
 

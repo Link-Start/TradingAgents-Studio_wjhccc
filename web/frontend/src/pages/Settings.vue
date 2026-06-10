@@ -101,6 +101,12 @@
           <n-descriptions-item :label="t('settings.dirCache')">{{ settings?.data_cache_dir }}</n-descriptions-item>
           <n-descriptions-item :label="t('settings.dirResults')">{{ settings?.results_dir }}</n-descriptions-item>
           <n-descriptions-item :label="t('settings.dirMemory')">{{ settings?.memory_log_path }}</n-descriptions-item>
+          <n-descriptions-item :label="t('settings.dbBackend')">
+            <n-tag size="small" :bordered="false" type="info" style="margin-right: 8px">
+              {{ settings?.db_backend?.dialect || '—' }}
+            </n-tag>
+            <span style="font-size: 12px; color: #909090">{{ settings?.db_backend?.url }}</span>
+          </n-descriptions-item>
         </n-descriptions>
       </n-card>
 

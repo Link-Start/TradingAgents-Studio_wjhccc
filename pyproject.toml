@@ -40,6 +40,10 @@ web = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "websockets>=14.0",
+    # DB layer: SQLAlchemy abstracts SQLite/MySQL; PyMySQL is the pure-Python
+    # MySQL driver used when TRADINGAGENTS_DB_URL points at mysql+pymysql://.
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1.0",
 ]
 # A-share market data (AKShare = free default for CN tickers)
 cn = [

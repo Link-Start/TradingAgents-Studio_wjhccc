@@ -10,7 +10,12 @@ from web.backend import database as db
 
 @pytest.fixture(autouse=True)
 def setup_db(tmp_path, monkeypatch):
+    # Force the SQLite-from-_DB_PATH path (ignore any ambient TRADINGAGENTS_DB_URL)
+    # and drop the cached engine so init_db rebuilds it against this temp file.
+    monkeypatch.delenv("TRADINGAGENTS_DB_URL", raising=False)
     monkeypatch.setattr(db, "_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(db, "_engine", None)
+    monkeypatch.setattr(db, "_engine_url", None)
     db.init_db()
 
 

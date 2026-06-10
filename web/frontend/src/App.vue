@@ -39,7 +39,11 @@
               </div>
             </n-layout-sider>
             <n-layout-content style="padding: 24px; overflow-y: auto">
-              <router-view />
+              <router-view v-if="ready" />
+              <div v-else class="boot-gate">
+                <n-spin size="large" />
+                <p class="boot-text">{{ t('app.starting') }}</p>
+              </div>
             </n-layout-content>
           </n-layout>
         </n-dialog-provider>
@@ -49,10 +53,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, ref } from 'vue'
+import { computed, h, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter, useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
+import api from './api'
 import {
   HomeOutline,
   AddCircleOutline,
@@ -75,6 +80,25 @@ const route = useRoute()
 
 const collapsed = ref(false)
 const isRedTheme = ref(localStorage.getItem('themeColor') !== 'green')
+
+// Boot gate: don't render pages until the backend answers /api/health. Right
+// after a restart the backend can take seconds to become ready; gating here
+// (plus the axios retry interceptor) replaces the old "empty tables that fill
+// in a moment later" flicker with an explicit "starting…" state.
+const ready = ref(false)
+async function waitForBackend() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      await api.get('/api/health')
+      ready.value = true
+      return
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+  }
+  ready.value = true // give up gracefully; let pages surface their own errors
+}
+onMounted(waitForBackend)
 
 function toggleThemeColor() {
   isRedTheme.value = !isRedTheme.value
@@ -148,5 +172,17 @@ body {
   display: flex;
   justify-content: center;
   gap: 6px;
+}
+.boot-gate {
+  height: 60vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.boot-text {
+  color: #909090;
+  font-size: 14px;
 }
 </style>

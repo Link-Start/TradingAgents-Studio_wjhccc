@@ -410,10 +410,22 @@ AKShare → Tushare → yfinance 的顺序路由。具体 chain 见
 
 ### Web 状态
 
-Web Studio 的 SQLite(runs、holdings、schedules、paper account、backtests)
-位于 `~/.tradingagents/web_state.db`,可通过 `TRADINGAGENTS_WEB_DB` 覆盖。
-**启动时若文件不存在会自动重建** —— 删掉它就等于清空状态。
+Web Studio 的数据库(runs、holdings、schedules、paper account、backtests)
+默认使用 SQLite,位于 `~/.tradingagents/web_state.db`(文件路径可通过
+`TRADINGAGENTS_WEB_DB` 覆盖)。**首次运行会自动检查并建表,已有数据绝不清除。**
 API Key 存在 `.env`,**不**存在这个数据库里。
+
+**改用 MySQL(或其他 SQLAlchemy 后端)。** 在 `.env` 里设置 `TRADINGAGENTS_DB_URL`
+为一个 SQLAlchemy URL 并重启即可,例如
+`TRADINGAGENTS_DB_URL=mysql+pymysql://user:pass@host:3306/tradingagents?charset=utf8mb4`。
+不设置时沿用原 SQLite 文件(零配置、完全向后兼容)。当前后端会在「设置」页只读显示。
+把已有 SQLite 历史数据迁移到新库(幂等、不清空目标):
+
+```bash
+python -m web.backend.migrate_db \
+  --source sqlite:///~/.tradingagents/web_state.db \
+  --target "$TRADINGAGENTS_DB_URL"
+```
 
 ---
 

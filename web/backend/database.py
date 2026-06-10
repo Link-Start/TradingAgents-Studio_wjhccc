@@ -1,273 +1,440 @@
-import sqlite3
-import json
 import os
-import threading
+import re
+import json
+import logging
 from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
 
+from sqlalchemy import (
+    create_engine, event, text, inspect as sa_inspect,
+    MetaData, Table, Column, Integer, Float, String, Text,
+    ForeignKey, Index, UniqueConstraint,
+)
+from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.engine import make_url
+
+logger = logging.getLogger(__name__)
+
+# Legacy SQLite file location. Still honoured for backward compatibility: when
+# TRADINGAGENTS_DB_URL is not set, the engine targets this file as
+# ``sqlite:///<_DB_PATH>``. Tests monkeypatch this attribute, so keep the name.
 _DB_PATH = os.getenv(
     "TRADINGAGENTS_WEB_DB",
     os.path.join(os.path.expanduser("~"), ".tradingagents", "web_state.db"),
 )
 
-# One connection per thread, reused across calls. Request-path DB work runs on
-# the default executor's thread pool (run_in_executor(None, ...)), so without
-# reuse every call paid connection-open + PRAGMA + close. Reusing keeps the
-# same SQLite isolation per call (we still commit at the end of each get_db
-# block) while dropping the per-call setup cost. WAL is a persistent DB-level
-# property set once at init_db(); per-connection we only set the cheap
-# pragmas that don't persist (busy_timeout, synchronous, foreign_keys).
-_thread_local = threading.local()
+# ---------------------------------------------------------------------------
+# Schema — declared once with SQLAlchemy MetaData so the SAME definition builds
+# on SQLite *and* MySQL (create_all emits the right per-dialect DDL: AUTOINCREMENT
+# vs AUTO_INCREMENT, VARCHAR vs TEXT, etc.). create_all is checkfirst=True and
+# NEVER drops — an existing SQLite DB keeps its rows and original column types.
+#
+# Cross-DB type notes:
+#   * id PKs are String(64) (not unbounded TEXT) because MySQL requires a bounded
+#     length on a primary key / indexed column. UUID hex ids are <=36 chars.
+#   * Timestamps stay ISO-8601 strings (app-generated) → String(40): portable,
+#     no dialect datetime/timezone surprises.
+#   * Large free text / JSON blobs use _BigText → LONGTEXT on MySQL (debate
+#     histories and config blobs can exceed MySQL's 64 KB TEXT limit).
+#   * from_holding / auto_trade stay INTEGER (0/1) to preserve existing read
+#     semantics the frontend already depends on.
+# ---------------------------------------------------------------------------
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS analyses (
-    id           TEXT PRIMARY KEY,
-    ticker       TEXT NOT NULL,
-    trade_date   TEXT NOT NULL,
-    asset_type   TEXT DEFAULT 'stock',
-    analysts     TEXT NOT NULL,
-    config_json  TEXT NOT NULL,
-    status       TEXT DEFAULT 'pending',
-    signal       TEXT,
-    confidence   REAL,
-    final_decision TEXT,
-    created_at   TEXT NOT NULL,
-    completed_at TEXT,
-    error_msg    TEXT
-);
+# TEXT on SQLite, LONGTEXT on MySQL (for columns that can exceed 64 KB).
+_BigText = Text().with_variant(LONGTEXT(), "mysql")
 
-CREATE TABLE IF NOT EXISTS agent_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    analysis_id  TEXT NOT NULL REFERENCES analyses(id),
-    agent_name   TEXT NOT NULL,
-    event_type   TEXT NOT NULL,
-    content      TEXT,
-    tokens_used  INTEGER,
-    timestamp    TEXT NOT NULL
-);
+_METADATA = MetaData()
 
-CREATE TABLE IF NOT EXISTS agent_reports (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    analysis_id  TEXT NOT NULL REFERENCES analyses(id),
-    agent_name   TEXT NOT NULL,
-    report_type  TEXT NOT NULL,
-    content      TEXT NOT NULL,
-    created_at   TEXT NOT NULL
-);
+Table(
+    "analyses", _METADATA,
+    Column("id", String(64), primary_key=True),
+    Column("ticker", String(32), nullable=False),
+    Column("trade_date", String(32), nullable=False),
+    Column("asset_type", String(16), server_default=text("'stock'")),
+    Column("analysts", Text, nullable=False),
+    Column("config_json", _BigText, nullable=False),
+    Column("status", String(24), server_default=text("'pending'")),
+    Column("signal", String(16)),
+    Column("confidence", Float),
+    Column("final_decision", _BigText),
+    Column("created_at", String(40), nullable=False),
+    Column("completed_at", String(40)),
+    Column("error_msg", Text),
+)
 
-CREATE TABLE IF NOT EXISTS holdings (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker       TEXT NOT NULL,
-    asset_type   TEXT NOT NULL DEFAULT 'stock',
-    shares       REAL NOT NULL,
-    cost_price   REAL NOT NULL,
-    open_date    TEXT,
-    notes        TEXT,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_holdings_ticker ON holdings(ticker);
+Table(
+    "agent_events", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("analysis_id", String(64), ForeignKey("analyses.id"), nullable=False),
+    Column("agent_name", String(64), nullable=False),
+    Column("event_type", String(64), nullable=False),
+    Column("content", _BigText),
+    Column("tokens_used", Integer),
+    Column("timestamp", String(40), nullable=False),
+)
 
-CREATE TABLE IF NOT EXISTS schedules (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    name             TEXT,
-    ticker           TEXT NOT NULL,
-    asset_type       TEXT NOT NULL DEFAULT 'stock',
-    schedule_type    TEXT NOT NULL,
-    interval_minutes INTEGER,
-    time_of_day      TEXT,
-    day_of_week      INTEGER,
-    analysts         TEXT NOT NULL,
-    config_json      TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'active',
-    fail_count       INTEGER NOT NULL DEFAULT 0,
-    last_run_at      TEXT,
-    last_analysis_id TEXT,
-    next_run_at      TEXT NOT NULL,
-    from_holding     INTEGER NOT NULL DEFAULT 0,
-    auto_trade       INTEGER NOT NULL DEFAULT 0,
-    auto_trade_cash_fraction REAL,
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_schedules_next ON schedules(next_run_at, status);
-CREATE INDEX IF NOT EXISTS idx_schedules_ticker ON schedules(ticker);
+Table(
+    "agent_reports", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("analysis_id", String(64), ForeignKey("analyses.id"), nullable=False),
+    Column("agent_name", String(64), nullable=False),
+    Column("report_type", String(64), nullable=False),
+    Column("content", _BigText, nullable=False),
+    Column("created_at", String(40), nullable=False),
+)
 
-CREATE TABLE IF NOT EXISTS paper_accounts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    name          TEXT NOT NULL,
-    initial_cash  REAL NOT NULL,
-    cash          REAL NOT NULL,
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-);
+Table(
+    "holdings", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ticker", String(32), nullable=False),
+    Column("asset_type", String(16), nullable=False, server_default=text("'stock'")),
+    Column("shares", Float, nullable=False),
+    Column("cost_price", Float, nullable=False),
+    Column("open_date", String(32)),
+    Column("notes", Text),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Index("idx_holdings_ticker", "ticker"),
+)
 
-CREATE TABLE IF NOT EXISTS paper_positions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id  INTEGER NOT NULL REFERENCES paper_accounts(id),
-    ticker      TEXT NOT NULL,
-    asset_type  TEXT NOT NULL DEFAULT 'stock',
-    shares      REAL NOT NULL,
-    avg_cost    REAL NOT NULL,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    UNIQUE (account_id, ticker)
-);
-CREATE INDEX IF NOT EXISTS idx_paper_positions_acct ON paper_positions(account_id);
+Table(
+    "schedules", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(255)),
+    Column("ticker", String(32), nullable=False),
+    Column("asset_type", String(16), nullable=False, server_default=text("'stock'")),
+    Column("schedule_type", String(24), nullable=False),
+    Column("interval_minutes", Integer),
+    Column("time_of_day", String(16)),
+    Column("day_of_week", Integer),
+    Column("analysts", Text, nullable=False),
+    Column("config_json", _BigText, nullable=False),
+    Column("status", String(16), nullable=False, server_default=text("'active'")),
+    Column("fail_count", Integer, nullable=False, server_default=text("0")),
+    Column("last_run_at", String(40)),
+    Column("last_analysis_id", String(64)),
+    Column("next_run_at", String(40), nullable=False),
+    Column("from_holding", Integer, nullable=False, server_default=text("0")),
+    Column("auto_trade", Integer, nullable=False, server_default=text("0")),
+    Column("auto_trade_cash_fraction", Float),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Index("idx_schedules_next", "next_run_at", "status"),
+    Index("idx_schedules_ticker", "ticker"),
+)
 
-CREATE TABLE IF NOT EXISTS paper_orders (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id          INTEGER NOT NULL REFERENCES paper_accounts(id),
-    ticker              TEXT NOT NULL,
-    asset_type          TEXT NOT NULL DEFAULT 'stock',
-    action              TEXT NOT NULL,
-    shares              REAL NOT NULL,
-    price               REAL NOT NULL,
-    source              TEXT NOT NULL DEFAULT 'manual',
-    source_analysis_id  TEXT,
-    notes               TEXT,
-    filled_at           TEXT NOT NULL,
-    created_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_paper_orders_acct ON paper_orders(account_id, filled_at);
+Table(
+    "paper_accounts", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(255), nullable=False),
+    Column("initial_cash", Float, nullable=False),
+    Column("cash", Float, nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
 
-CREATE TABLE IF NOT EXISTS paper_nav (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id      INTEGER NOT NULL REFERENCES paper_accounts(id),
-    snapshot_date   TEXT NOT NULL,
-    cash            REAL NOT NULL,
-    positions_value REAL NOT NULL,
-    total_value     REAL NOT NULL,
-    created_at      TEXT NOT NULL,
-    UNIQUE (account_id, snapshot_date)
-);
-CREATE INDEX IF NOT EXISTS idx_paper_nav_acct ON paper_nav(account_id, snapshot_date);
+Table(
+    "paper_positions", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("account_id", Integer, ForeignKey("paper_accounts.id"), nullable=False),
+    Column("ticker", String(32), nullable=False),
+    Column("asset_type", String(16), nullable=False, server_default=text("'stock'")),
+    Column("shares", Float, nullable=False),
+    Column("avg_cost", Float, nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    UniqueConstraint("account_id", "ticker", name="uq_paper_positions_acct_ticker"),
+    Index("idx_paper_positions_acct", "account_id"),
+)
 
-CREATE TABLE IF NOT EXISTS backtest_runs (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT NOT NULL,
-    signal_source   TEXT NOT NULL,
-    source_config   TEXT NOT NULL,
-    tickers         TEXT,
-    benchmark       TEXT,
-    start_date      TEXT NOT NULL,
-    end_date        TEXT NOT NULL,
-    initial_cash    REAL NOT NULL,
-    sizing_mode     TEXT NOT NULL,
-    sizing_config   TEXT NOT NULL,
-    confidence_floor REAL,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    metrics_json    TEXT,
-    warnings        TEXT,
-    final_cash      REAL,
-    final_total     REAL,
-    error_msg       TEXT,
-    created_at      TEXT NOT NULL,
-    completed_at    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_backtest_runs_created ON backtest_runs(created_at DESC);
+Table(
+    "paper_orders", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("account_id", Integer, ForeignKey("paper_accounts.id"), nullable=False),
+    Column("ticker", String(32), nullable=False),
+    Column("asset_type", String(16), nullable=False, server_default=text("'stock'")),
+    Column("action", String(8), nullable=False),
+    Column("shares", Float, nullable=False),
+    Column("price", Float, nullable=False),
+    Column("source", String(16), nullable=False, server_default=text("'manual'")),
+    Column("source_analysis_id", String(64)),
+    Column("notes", Text),
+    Column("filled_at", String(40), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Index("idx_paper_orders_acct", "account_id", "filled_at"),
+)
 
-CREATE TABLE IF NOT EXISTS backtest_trades (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id          INTEGER NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
-    timestamp       TEXT NOT NULL,
-    ticker          TEXT NOT NULL,
-    action          TEXT NOT NULL,
-    shares          REAL NOT NULL,
-    price           REAL NOT NULL,
-    fee             REAL NOT NULL,
-    realised_pnl    REAL NOT NULL,
-    source_analysis_id TEXT,
-    metadata_json   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id, timestamp);
+Table(
+    "paper_nav", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("account_id", Integer, ForeignKey("paper_accounts.id"), nullable=False),
+    Column("snapshot_date", String(32), nullable=False),
+    Column("cash", Float, nullable=False),
+    Column("positions_value", Float, nullable=False),
+    Column("total_value", Float, nullable=False),
+    Column("created_at", String(40), nullable=False),
+    UniqueConstraint("account_id", "snapshot_date", name="uq_paper_nav_acct_date"),
+    Index("idx_paper_nav_acct", "account_id", "snapshot_date"),
+)
 
-CREATE TABLE IF NOT EXISTS backtest_nav (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id          INTEGER NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
-    snapshot_date   TEXT NOT NULL,
-    total_value     REAL NOT NULL,
-    benchmark_value REAL
-);
-CREATE INDEX IF NOT EXISTS idx_backtest_nav_run ON backtest_nav(run_id, snapshot_date);
+Table(
+    "backtest_runs", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(255), nullable=False),
+    Column("signal_source", String(64), nullable=False),
+    Column("source_config", _BigText, nullable=False),
+    Column("tickers", Text),
+    Column("benchmark", String(32)),
+    Column("start_date", String(32), nullable=False),
+    Column("end_date", String(32), nullable=False),
+    Column("initial_cash", Float, nullable=False),
+    Column("sizing_mode", String(32), nullable=False),
+    Column("sizing_config", _BigText, nullable=False),
+    Column("confidence_floor", Float),
+    Column("status", String(16), nullable=False, server_default=text("'pending'")),
+    Column("metrics_json", _BigText),
+    Column("warnings", Text),
+    Column("final_cash", Float),
+    Column("final_total", Float),
+    Column("error_msg", Text),
+    Column("created_at", String(40), nullable=False),
+    Column("completed_at", String(40)),
+    Index("idx_backtest_runs_created", "created_at"),
+)
 
-CREATE TABLE IF NOT EXISTS screen_runs (
-    id              TEXT PRIMARY KEY,
-    text            TEXT,
-    strategy_json   TEXT,
-    candidates_json TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    error_msg       TEXT,
-    created_at      TEXT NOT NULL,
-    completed_at    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_screen_runs_created ON screen_runs(created_at DESC);
-"""
+Table(
+    "backtest_trades", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", Integer, ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False),
+    Column("timestamp", String(40), nullable=False),
+    Column("ticker", String(32), nullable=False),
+    Column("action", String(8), nullable=False),
+    Column("shares", Float, nullable=False),
+    Column("price", Float, nullable=False),
+    Column("fee", Float, nullable=False),
+    Column("realised_pnl", Float, nullable=False),
+    Column("source_analysis_id", String(64)),
+    Column("metadata_json", _BigText),
+    Index("idx_backtest_trades_run", "run_id", "timestamp"),
+)
+
+Table(
+    "backtest_nav", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("run_id", Integer, ForeignKey("backtest_runs.id", ondelete="CASCADE"), nullable=False),
+    Column("snapshot_date", String(40), nullable=False),
+    Column("total_value", Float, nullable=False),
+    Column("benchmark_value", Float),
+    Index("idx_backtest_nav_run", "run_id", "snapshot_date"),
+)
+
+Table(
+    "screen_runs", _METADATA,
+    Column("id", String(64), primary_key=True),
+    Column("text", Text),
+    Column("strategy_json", _BigText),
+    Column("candidates_json", _BigText),
+    Column("status", String(16), nullable=False, server_default=text("'pending'")),
+    Column("error_msg", Text),
+    Column("created_at", String(40), nullable=False),
+    Column("completed_at", String(40)),
+    Index("idx_screen_runs_created", "created_at"),
+)
 
 
-def _ensure_dir():
-    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+# ---------------------------------------------------------------------------
+# Engine — one SQLAlchemy Engine per process, rebuilt only when the resolved URL
+# changes (tests monkeypatch _DB_PATH between cases). The connection pool replaces
+# the old per-thread connection cache.
+# ---------------------------------------------------------------------------
+
+_engine = None
+_engine_url: Optional[str] = None
 
 
-def _get_conn() -> sqlite3.Connection:
-    """Return this thread's reused SQLite connection, creating it once.
+def _resolve_url() -> str:
+    """SQLAlchemy URL for the configured backend.
 
-    The per-connection pragmas below are not persistent so they're set on
-    creation. WAL (a persistent DB property) is set once in init_db().
-
-    Keyed by the current ``_DB_PATH`` so that if the path changes (tests
-    monkeypatch it per case), a stale connection bound to the old DB is
-    replaced instead of silently querying the wrong file.
+    ``TRADINGAGENTS_DB_URL`` wins when set (e.g.
+    ``mysql+pymysql://user:pass@host:3306/db?charset=utf8mb4``). Otherwise we
+    fall back to the legacy SQLite file so existing installs need zero config.
     """
-    conn = getattr(_thread_local, "conn", None)
-    if conn is not None and getattr(_thread_local, "path", None) == _DB_PATH:
-        return conn
-    if conn is not None:
-        conn.close()
-    _ensure_dir()
-    conn = sqlite3.connect(_DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    _thread_local.conn = conn
-    _thread_local.path = _DB_PATH
-    return conn
+    url = os.getenv("TRADINGAGENTS_DB_URL")
+    if url and url.strip():
+        return url.strip()
+    from pathlib import Path
+    return "sqlite:///" + Path(_DB_PATH).as_posix()
+
+
+def _get_engine():
+    global _engine, _engine_url
+    url = _resolve_url()
+    if _engine is not None and _engine_url == url:
+        return _engine
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+    parsed = make_url(url)
+    is_sqlite = parsed.get_backend_name() == "sqlite"
+    if is_sqlite:
+        db_file = parsed.database
+        if db_file and db_file != ":memory:":
+            parent = os.path.dirname(os.path.abspath(db_file))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        engine = create_engine(
+            url, future=True,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+            # Non-persistent pragmas (busy_timeout/synchronous/foreign_keys) plus
+            # WAL (persistent but idempotent) — same tuning the old code applied.
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.close()
+    else:
+        # MySQL / others: pool_pre_ping survives idle-connection drops;
+        # pool_recycle stays under MySQL's default wait_timeout.
+        engine = create_engine(
+            url, future=True, pool_pre_ping=True, pool_recycle=1800,
+        )
+    _engine = engine
+    _engine_url = url
+    logger.info("DB engine ready: %s", parsed.render_as_string(hide_password=True))
+    return engine
+
+
+def current_backend() -> dict:
+    """Backend descriptor for the Settings page (dialect + password-masked URL)."""
+    parsed = make_url(_resolve_url())
+    return {
+        "dialect": parsed.get_backend_name(),
+        "url": parsed.render_as_string(hide_password=True),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim — lets the existing query functions keep their SQLite-style
+# API (``conn.execute(sql_with_?, (params,))`` → rows that support ``dict(row)``,
+# ``row["col"]``, ``row[0]``, plus ``.lastrowid`` / ``.rowcount``) while running
+# on any SQLAlchemy backend. ``?`` placeholders are rewritten to named binds so
+# the same SQL works under both qmark (SQLite) and format (pymysql) paramstyles.
+# ---------------------------------------------------------------------------
+
+class _Row(dict):
+    """dict with positional access too, mirroring ``sqlite3.Row`` semantics."""
+
+    def __init__(self, mapping):
+        super().__init__(mapping)
+        self._vals = list(mapping.values())
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return super().__getitem__(key)
+
+
+def _named_sql(sql: str) -> str:
+    """Rewrite positional ``?`` placeholders to ``:p0, :p1, …`` named binds."""
+    counter = {"n": 0}
+
+    def repl(_m):
+        k = counter["n"]
+        counter["n"] += 1
+        return f":p{k}"
+
+    return re.sub(r"\?", repl, sql)
+
+
+def _binds(params) -> dict:
+    return {f"p{i}": v for i, v in enumerate(params)}
+
+
+class _ExecResult:
+    """Wraps a SQLAlchemy CursorResult with the sqlite3-cursor surface used here."""
+
+    def __init__(self, sa_result):
+        self._sa = sa_result
+        self.lastrowid = None
+        self.rowcount = -1
+        if sa_result is not None:
+            try:
+                self.rowcount = sa_result.rowcount
+            except Exception:  # pragma: no cover - dialect quirk
+                self.rowcount = -1
+            try:
+                self.lastrowid = sa_result.lastrowid
+            except Exception:
+                self.lastrowid = None
+        self._rows_cache = None
+
+    def _rows(self):
+        if self._rows_cache is None:
+            if self._sa is not None and self._sa.returns_rows:
+                self._rows_cache = [_Row(m) for m in self._sa.mappings()]
+            else:
+                self._rows_cache = []
+        return self._rows_cache
+
+    def fetchone(self):
+        rows = self._rows()
+        return rows[0] if rows else None
+
+    def fetchall(self):
+        return list(self._rows())
+
+
+class _Conn:
+    """Thin wrapper exposing ``execute`` / ``executemany`` over a SA connection."""
+
+    def __init__(self, sa_conn):
+        self._c = sa_conn
+
+    def execute(self, sql: str, params=None) -> _ExecResult:
+        binds = _binds(list(params)) if params else {}
+        return _ExecResult(self._c.execute(text(_named_sql(sql)), binds))
+
+    def executemany(self, sql: str, seq_params) -> _ExecResult:
+        seq = [list(p) for p in seq_params]
+        if not seq:
+            return _ExecResult(None)
+        rows = [_binds(p) for p in seq]
+        return _ExecResult(self._c.execute(text(_named_sql(sql)), rows))
 
 
 @contextmanager
 def get_db():
-    conn = _get_conn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def _add_column_if_missing(conn, table: str, col: str, ddl: str):
-    """Idempotent ALTER TABLE — adds ``col`` to ``table`` if absent.
-
-    The base schema only CREATEs tables IF NOT EXISTS, so columns added to
-    an existing DB need an explicit migration. Safe to run on every startup.
-    """
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-    if col not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    """Transactional connection: commits on clean exit, rolls back on error."""
+    engine = _get_engine()
+    with engine.begin() as sa_conn:
+        yield _Conn(sa_conn)
 
 
 def init_db():
-    with get_db() as conn:
-        # WAL is a persistent DB-level property — set it once here rather than
-        # on every connection. Lets readers and the writer coexist, which the
-        # concurrent request path + background analyses rely on.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(_SCHEMA)
-        # Migrations for columns added after a DB was first created.
-        _add_column_if_missing(conn, "schedules", "auto_trade", "INTEGER NOT NULL DEFAULT 0")
-        _add_column_if_missing(conn, "schedules", "auto_trade_cash_fraction", "REAL")
+    """Create any missing tables (never drops) and apply column migrations.
+
+    ``create_all`` is checkfirst=True, so an existing SQLite DB is left fully
+    intact — only absent tables are created. On a fresh MySQL database it builds
+    the whole schema from the MetaData above.
+    """
+    engine = _get_engine()
+    _METADATA.create_all(engine)
+    # Column migrations for DBs created before a column was added. Only matters
+    # for a pre-existing SQLite file; a fresh DB already has the column.
+    with engine.begin() as conn:
+        cols = {c["name"] for c in sa_inspect(conn).get_columns("schedules")}
+        if "auto_trade" not in cols:
+            conn.execute(text(
+                "ALTER TABLE schedules ADD COLUMN auto_trade INTEGER NOT NULL DEFAULT 0"))
+        if "auto_trade_cash_fraction" not in cols:
+            conn.execute(text(
+                "ALTER TABLE schedules ADD COLUMN auto_trade_cash_fraction REAL"))
 
 
 # --- Analyses CRUD ---
@@ -779,11 +946,52 @@ def reset_paper_account(account_id: int,
     return get_paper_account(account_id)
 
 
+def adjust_paper_capital(account_id: int, delta: float) -> tuple[Optional[dict], Optional[str]]:
+    """Inject or withdraw capital WITHOUT touching positions / orders.
+
+    Adds ``delta`` to BOTH cash and initial_cash so the P&L baseline stays
+    consistent (adding money is not a gain). This is the safe alternative to
+    ``reset_paper_account`` for "加钱": holdings and order history are preserved.
+    A negative delta withdraws; rejected if it would drive cash below zero.
+    Returns ``(account_dict, None)`` or ``(None, error_msg)``.
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT initial_cash, cash FROM paper_accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if not row:
+            return None, "account not found"
+        new_cash = row["cash"] + delta
+        if new_cash < -1e-9:
+            return None, f"现金不足:当前可用 {row['cash']:.2f},无法减少 {abs(delta):.2f}"
+        new_initial = max(0.0, row["initial_cash"] + delta)
+        conn.execute(
+            "UPDATE paper_accounts SET initial_cash = ?, cash = ?, updated_at = ? WHERE id = ?",
+            (new_initial, new_cash, now, account_id),
+        )
+    return get_paper_account(account_id), None
+
+
 def list_paper_positions(account_id: int) -> list:
+    # Decorate each open position with its most recent BUY order's provenance
+    # (source + analysis id + fill time) so the Holdings table can show "where
+    # did this position come from" and link back to the triggering analysis —
+    # the position row itself doesn't carry a source, only the orders do.
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM paper_positions WHERE account_id = ? AND shares > 0 "
-            "ORDER BY ticker",
+            "SELECT p.*, "
+            "  o.source        AS last_buy_source, "
+            "  o.source_analysis_id AS source_analysis_id, "
+            "  o.filled_at     AS last_buy_at "
+            "FROM paper_positions p "
+            "LEFT JOIN paper_orders o ON o.id = ("
+            "  SELECT id FROM paper_orders b "
+            "  WHERE b.account_id = p.account_id AND b.ticker = p.ticker "
+            "        AND b.action = 'buy' "
+            "  ORDER BY b.filled_at DESC LIMIT 1) "
+            "WHERE p.account_id = ? AND p.shares > 0 "
+            "ORDER BY p.ticker",
             (account_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -965,18 +1173,31 @@ def upsert_paper_nav(
     cash: float,
     positions_value: float,
 ):
-    """Insert or replace the NAV snapshot for ``snapshot_date``."""
+    """Insert or replace the NAV snapshot for ``snapshot_date``.
+
+    Portable upsert (SELECT-then-UPDATE/INSERT) instead of SQLite's
+    ``ON CONFLICT`` so it works identically on MySQL. The (account_id,
+    snapshot_date) UNIQUE constraint guarantees at most one row per day.
+    """
     now = datetime.utcnow().isoformat() + "Z"
     total = cash + positions_value
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO paper_nav (account_id, snapshot_date, cash, positions_value, "
-            "total_value, created_at) VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(account_id, snapshot_date) DO UPDATE SET "
-            "cash = excluded.cash, positions_value = excluded.positions_value, "
-            "total_value = excluded.total_value",
-            (account_id, snapshot_date, cash, positions_value, total, now),
-        )
+        exists = conn.execute(
+            "SELECT 1 FROM paper_nav WHERE account_id = ? AND snapshot_date = ?",
+            (account_id, snapshot_date),
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE paper_nav SET cash = ?, positions_value = ?, total_value = ? "
+                "WHERE account_id = ? AND snapshot_date = ?",
+                (cash, positions_value, total, account_id, snapshot_date),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO paper_nav (account_id, snapshot_date, cash, positions_value, "
+                "total_value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (account_id, snapshot_date, cash, positions_value, total, now),
+            )
 
 
 # --- Backtesting ---
@@ -1139,3 +1360,20 @@ def delete_backtest_run(run_id: int):
         conn.execute("DELETE FROM backtest_trades WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM backtest_nav WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM backtest_runs WHERE id = ?", (run_id,))
+
+
+def checkpoint_sqlite():
+    """Best-effort WAL checkpoint on shutdown — SQLite only, no-op otherwise.
+
+    Truncating the WAL on a clean stop keeps the next startup's recovery short
+    (a large un-checkpointed WAL is part of why the UI looked momentarily empty
+    right after a restart). Non-SQLite backends manage their own logs.
+    """
+    try:
+        engine = _get_engine()
+        if engine.dialect.name != "sqlite":
+            return
+        with engine.begin() as conn:
+            conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+    except Exception:  # pragma: no cover - shutdown best-effort
+        logger.warning("WAL checkpoint on shutdown failed", exc_info=True)

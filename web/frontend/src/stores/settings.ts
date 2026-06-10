@@ -14,6 +14,9 @@ export interface Settings {
   data_cache_dir: string
   results_dir: string
   memory_log_path: string
+  // Read-only: active DB backend (dialect + password-masked URL). Set via
+  // TRADINGAGENTS_DB_URL in .env + restart, not editable from the UI.
+  db_backend?: { dialect: string; url: string }
 }
 
 export interface ModelOption {

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .database import init_db, fail_stale_runs
+from .database import init_db, fail_stale_runs, checkpoint_sqlite
 from .executors import shutdown as shutdown_heavy_executor
 from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen, quality
 from .scheduler import service as scheduler_service
@@ -57,6 +57,8 @@ async def lifespan(app):
     logger.info("Server shutting down.")
     await scheduler_service.stop()
     shutdown_heavy_executor()
+    # Truncate the SQLite WAL so the next startup recovers fast (no-op on MySQL).
+    checkpoint_sqlite()
 
 
 app = FastAPI(title="TradingAgents Web", version="0.1.0", lifespan=lifespan)
