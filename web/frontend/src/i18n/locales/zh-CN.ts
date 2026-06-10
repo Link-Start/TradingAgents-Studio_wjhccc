@@ -708,6 +708,8 @@ export default {
     investDebateEmpty: '本次分析未启用 / 未产生研究辩论',
     riskDebateEmpty: '本次分析未启用 / 未产生风险讨论',
     noReports: '暂无报告数据',
+    failedTitle: '本次分析失败',
+    failedNoReason: '未记录失败原因(可能是旧版本的记录)。',
     timelineTitle: '执行时间线',
     tabs: {
       macro: '宏观环境',

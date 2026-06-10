@@ -12,6 +12,16 @@
     </n-page-header>
 
     <n-spin :show="loading">
+      <!-- Failure reason — make a 'failed' run actionable instead of blank -->
+      <n-alert
+        v-if="analysis?.status === 'failed'"
+        type="error"
+        :title="t('report.failedTitle')"
+        style="margin-bottom: 16px"
+      >
+        <span style="white-space: pre-wrap">{{ analysis.error_msg || t('report.failedNoReason') }}</span>
+      </n-alert>
+
       <!-- Summary Card -->
       <n-card v-if="analysis" size="small">
         <n-descriptions :column="4" bordered>

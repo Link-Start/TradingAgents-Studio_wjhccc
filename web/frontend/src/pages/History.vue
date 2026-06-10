@@ -25,7 +25,7 @@
 import { ref, reactive, computed, onMounted, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { NButton, NTag, NSpace, useDialog } from 'naive-ui'
+import { NButton, NTag, NSpace, NTooltip, useDialog } from 'naive-ui'
 import api from '../api'
 import { formatDateTime } from '../utils/datetime'
 
@@ -54,8 +54,20 @@ const columns = computed(() => [
   { title: t('history.cols.ticker'), key: 'ticker', width: 100 },
   { title: t('history.cols.date'), key: 'trade_date', width: 120 },
   {
-    title: t('history.cols.signal'), key: 'signal', width: 80,
-    render: (row: any) => h(NTag, { type: signalType(row.signal), size: 'small' }, () => row.signal || row.status),
+    title: t('history.cols.signal'), key: 'signal', width: 90,
+    render: (row: any) => {
+      const tag = h(NTag, { type: signalType(row.signal, row.status), size: 'small' },
+        () => row.signal || row.status)
+      // Failed runs: reveal the stored reason on hover instead of a bare
+      // "failed" the user can't act on. (error_msg comes back from /api/history.)
+      if (row.status === 'failed' && row.error_msg) {
+        return h(NTooltip, { style: 'max-width: 460px', placement: 'top' }, {
+          trigger: () => h('span', { style: 'cursor: help; border-bottom: 1px dashed currentColor' }, [tag]),
+          default: () => h('span', { style: 'white-space: pre-wrap' }, row.error_msg),
+        })
+      }
+      return tag
+    },
   },
   { title: t('history.cols.confidence'), key: 'confidence', width: 80, render: (row: any) => row.confidence ? `${row.confidence}%` : '-' },
   { title: t('history.cols.createdAt'), key: 'created_at', width: 180, render: (row: any) => formatDateTime(row.created_at) },
@@ -68,7 +80,8 @@ const columns = computed(() => [
   },
 ])
 
-function signalType(signal: string) {
+function signalType(signal: string, status?: string) {
+  if (status === 'failed') return 'error'
   if (signal === 'BUY') return 'success'
   if (signal === 'SELL') return 'error'
   return 'warning'

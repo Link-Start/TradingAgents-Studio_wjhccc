@@ -708,6 +708,8 @@ export default {
     investDebateEmpty: 'This analysis did not enable / produce a research debate.',
     riskDebateEmpty: 'This analysis did not enable / produce a risk debate.',
     noReports: 'No report data',
+    failedTitle: 'This analysis failed',
+    failedNoReason: 'No failure reason recorded (likely an older record).',
     timelineTitle: 'Timeline',
     tabs: {
       macro: 'Macro',
