@@ -25,6 +25,8 @@ from typing import Optional
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 
+from ..executors import quote_executor
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/quote", tags=["quote"])
@@ -352,12 +354,12 @@ async def ohlc(ticker: str, days: int = 60, interval: str = "daily"):
     loop = asyncio.get_running_loop()
     if interval == "daily":
         bars = await loop.run_in_executor(
-            None,
+            quote_executor,
             lambda: _with_retry(lambda: _fetch_ohlc_sync(ticker, days)),
         )
     elif interval in _INTERVAL_TO_AK_PERIOD:
         bars = await loop.run_in_executor(
-            None,
+            quote_executor,
             lambda: _with_retry(lambda: _fetch_intraday_sync(ticker, interval, days)),
         )
     else:

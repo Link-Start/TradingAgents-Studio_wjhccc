@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.utils.stats_handler import StatsCallbackHandler
 
 from . import database as db
 from .executors import heavy_executor, analysis_semaphore
@@ -94,6 +95,9 @@ class GraphRunner:
         # chunk would otherwise re-emit every analyst; track which we've already
         # surfaced so each agent_complete fires exactly once.
         self._emitted_agents: set = set()
+        # Bound to both LLM clients via TradingAgentsGraph(callbacks=...);
+        # accumulates token usage across every call in the run.
+        self._stats = StatsCallbackHandler()
 
     async def _emit(self, event_type: str, agent: str, content: str = "",
                     tokens: int = 0, extra: Optional[dict] = None):
@@ -127,6 +131,7 @@ class GraphRunner:
             selected_analysts=self.selected_analysts,
             debug=True,
             config=self.config,
+            callbacks=[self._stats],
             on_node_complete=self._on_node,
         )
         return graph.propagate(
@@ -293,19 +298,33 @@ class GraphRunner:
             # Determine signal direction
             signal_direction = _extract_signal_direction(signal)
 
+            usage = self._stats.get_stats()
             db.update_analysis_status(
                 self.analysis_id, "complete",
                 signal=signal_direction,
                 confidence=confidence,
                 final_decision=final_decision,
+                tokens_in=usage["tokens_in"],
+                tokens_out=usage["tokens_out"],
+                llm_calls=usage["llm_calls"],
             )
-            await self._emit("analysis_complete", "system", signal)
+            await self._emit(
+                "analysis_complete", "system", signal,
+                tokens=usage["tokens_in"] + usage["tokens_out"],
+                extra={"usage": usage},
+            )
             return final_state, signal
 
         except Exception as e:
             logger.exception("Analysis %s failed", self.analysis_id)
             friendly = _friendly_llm_error(e)
-            db.update_analysis_status(self.analysis_id, "failed", error_msg=friendly)
+            usage = self._stats.get_stats()  # tokens burned before the failure
+            db.update_analysis_status(
+                self.analysis_id, "failed", error_msg=friendly,
+                tokens_in=usage["tokens_in"],
+                tokens_out=usage["tokens_out"],
+                llm_calls=usage["llm_calls"],
+            )
             await self._emit("error", "system", friendly)
             return None
 

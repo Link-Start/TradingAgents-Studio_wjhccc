@@ -33,6 +33,9 @@
           <n-descriptions-item :label="t('report.summary.createdAt')">{{ formatDateTime(analysis.created_at) }}</n-descriptions-item>
           <n-descriptions-item :label="t('report.summary.completedAt')">{{ formatDateTime(analysis.completed_at) }}</n-descriptions-item>
           <n-descriptions-item :label="t('report.summary.assetType')">{{ analysis.asset_type }}</n-descriptions-item>
+          <n-descriptions-item v-if="analysis.tokens_in != null" :label="t('report.summary.tokens')">
+            {{ t('report.summary.tokensValue', { tin: formatTokens(analysis.tokens_in), tout: formatTokens(analysis.tokens_out), calls: analysis.llm_calls ?? '-' }) }}
+          </n-descriptions-item>
         </n-descriptions>
       </n-card>
 
@@ -191,6 +194,11 @@ const signalType = computed(() => {
   if (s === 'SELL') return 'error'
   return 'warning'
 })
+
+function formatTokens(n: number | null | undefined): string {
+  if (n == null) return '-'
+  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : n.toLocaleString()
+}
 
 // Order in which we want tabs to appear in the UI.
 const TAB_ORDER = [

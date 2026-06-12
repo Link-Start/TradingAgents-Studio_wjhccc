@@ -61,6 +61,15 @@ Table(
     Column("created_at", String(40), nullable=False),
     Column("completed_at", String(40)),
     Column("error_msg", Text),
+    # LLM usage for the whole run, filled in when the analysis completes.
+    Column("tokens_in", Integer),
+    Column("tokens_out", Integer),
+    Column("llm_calls", Integer),
+    # list_analyses orders by created_at; latest_signal(s)_for_ticker(s) filter
+    # on (ticker, status) then take the newest — both need these to avoid full
+    # table scans as history grows.
+    Index("idx_analyses_created", "created_at"),
+    Index("idx_analyses_ticker_status_created", "ticker", "status", "created_at"),
 )
 
 Table(
@@ -72,6 +81,8 @@ Table(
     Column("content", _BigText),
     Column("tokens_used", Integer),
     Column("timestamp", String(40), nullable=False),
+    # SQLite does not auto-index FK columns; WS replay + delete filter on this.
+    Index("idx_agent_events_analysis", "analysis_id"),
 )
 
 Table(
@@ -82,6 +93,7 @@ Table(
     Column("report_type", String(64), nullable=False),
     Column("content", _BigText, nullable=False),
     Column("created_at", String(40), nullable=False),
+    Index("idx_agent_reports_analysis", "analysis_id"),
 )
 
 Table(
@@ -425,6 +437,19 @@ def init_db():
     """
     engine = _get_engine()
     _METADATA.create_all(engine)
+    # create_all skips tables that already exist — including any indexes added
+    # to the schema after the table was first created. Create those explicitly
+    # so pre-existing DBs pick up new indexes (checkfirst makes this idempotent).
+    with engine.begin() as conn:
+        existing = {
+            ix["name"]
+            for table in _METADATA.tables.values()
+            for ix in sa_inspect(conn).get_indexes(table.name)
+        }
+        for table in _METADATA.tables.values():
+            for index in table.indexes:
+                if index.name not in existing:
+                    index.create(conn)
     # Column migrations for DBs created before a column was added. Only matters
     # for a pre-existing SQLite file; a fresh DB already has the column.
     with engine.begin() as conn:
@@ -435,6 +460,10 @@ def init_db():
         if "auto_trade_cash_fraction" not in cols:
             conn.execute(text(
                 "ALTER TABLE schedules ADD COLUMN auto_trade_cash_fraction REAL"))
+        a_cols = {c["name"] for c in sa_inspect(conn).get_columns("analyses")}
+        for col in ("tokens_in", "tokens_out", "llm_calls"):
+            if col not in a_cols:
+                conn.execute(text(f"ALTER TABLE analyses ADD COLUMN {col} INTEGER"))
 
 
 # --- Analyses CRUD ---
@@ -454,7 +483,10 @@ def create_analysis(id: str, ticker: str, trade_date: str, asset_type: str,
 def update_analysis_status(id: str, status: str, signal: Optional[str] = None,
                            confidence: Optional[float] = None,
                            final_decision: Optional[str] = None,
-                           error_msg: Optional[str] = None):
+                           error_msg: Optional[str] = None,
+                           tokens_in: Optional[int] = None,
+                           tokens_out: Optional[int] = None,
+                           llm_calls: Optional[int] = None):
     with get_db() as conn:
         fields = ["status = ?"]
         params = [status]
@@ -470,6 +502,15 @@ def update_analysis_status(id: str, status: str, signal: Optional[str] = None,
         if error_msg is not None:
             fields.append("error_msg = ?")
             params.append(error_msg)
+        if tokens_in is not None:
+            fields.append("tokens_in = ?")
+            params.append(tokens_in)
+        if tokens_out is not None:
+            fields.append("tokens_out = ?")
+            params.append(tokens_out)
+        if llm_calls is not None:
+            fields.append("llm_calls = ?")
+            params.append(llm_calls)
         if status in ("complete", "failed"):
             fields.append("completed_at = ?")
             params.append(datetime.utcnow().isoformat() + "Z")
@@ -502,10 +543,15 @@ def list_analyses(ticker: Optional[str] = None, signal: Optional[str] = None,
         params.append(date_to)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    # List view only needs metadata — final_decision / config_json can be tens
+    # of KB per row and would bloat every page of results.
+    list_cols = ("id, ticker, trade_date, asset_type, analysts, status, signal, "
+                 "confidence, created_at, completed_at, error_msg, "
+                 "tokens_in, tokens_out, llm_calls")
     with get_db() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM analyses {where}", params).fetchone()[0]
         rows = conn.execute(
-            f"SELECT * FROM analyses {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT {list_cols} FROM analyses {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             params + [size, (page - 1) * size],
         ).fetchall()
     return {"total": total, "page": page, "size": size, "items": [dict(r) for r in rows]}
@@ -748,6 +794,37 @@ def latest_signal_for_ticker(ticker: str) -> Optional[dict]:
             (ticker,),
         ).fetchone()
     return dict(row) if row else None
+
+
+def latest_signals_for_tickers(tickers: list[str]) -> dict[str, dict]:
+    """Most recent complete analysis per ticker, in ONE query.
+
+    Batch variant of ``latest_signal_for_ticker`` for list views (holdings page)
+    — avoids N+1 round trips. Greatest-n-per-group via a MAX(created_at) join
+    rather than window functions so it runs on SQLite and older MySQL alike.
+    Returns ``{ticker: row_dict}``; tickers with no complete analysis are absent.
+    """
+    tickers = list(dict.fromkeys(tickers))  # dedupe, keep order
+    if not tickers:
+        return {}
+    placeholders = ",".join("?" * len(tickers))
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT a.id, a.ticker, a.signal, a.confidence, a.trade_date, a.created_at "
+            f"FROM analyses a "
+            f"JOIN (SELECT ticker, MAX(created_at) AS max_created "
+            f"      FROM analyses WHERE status = 'complete' AND ticker IN ({placeholders}) "
+            f"      GROUP BY ticker) m "
+            f"  ON m.ticker = a.ticker AND m.max_created = a.created_at "
+            f"WHERE a.status = 'complete'",
+            tickers,
+        ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        d = dict(r)
+        ticker = d.pop("ticker")
+        out[ticker] = d
+    return out
 
 
 # --- Schedules ---

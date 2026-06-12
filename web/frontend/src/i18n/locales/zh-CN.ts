@@ -704,6 +704,8 @@ export default {
       createdAt: '创建时间',
       completedAt: '完成时间',
       assetType: '资产类型',
+      tokens: 'Token 用量',
+      tokensValue: '输入 {tin} / 输出 {tout}（{calls} 次调用）',
     },
     investDebateEmpty: '本次分析未启用 / 未产生研究辩论',
     riskDebateEmpty: '本次分析未启用 / 未产生风险讨论',

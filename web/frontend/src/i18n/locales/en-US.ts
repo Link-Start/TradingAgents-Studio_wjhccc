@@ -704,6 +704,8 @@ export default {
       createdAt: 'Created at',
       completedAt: 'Completed at',
       assetType: 'Asset type',
+      tokens: 'Token usage',
+      tokensValue: '{tin} in / {tout} out ({calls} calls)',
     },
     investDebateEmpty: 'This analysis did not enable / produce a research debate.',
     riskDebateEmpty: 'This analysis did not enable / produce a risk debate.',

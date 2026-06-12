@@ -25,9 +25,11 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from fastapi import APIRouter, HTTPException
 
 from .. import database as db
+from ..executors import quote_executor
 from ..models import (
     PaperOrderRequest, PaperOrderFromDecision, PaperAccountReset, PaperCapitalAdjust,
 )
@@ -82,23 +84,27 @@ def _price_cache_put(ticker: str, price: Optional[float]) -> None:
 # (``stock_info_a_code_name``: ~5500 rows of code+name, no quotes), cached for
 # hours since listings rename rarely. Positions/orders only ever need a dict
 # lookup off this map, so we never fan out per-ticker name fetches.
+#
+# Single-flight: AKShare's underlying request has NO timeout, so on a degraded
+# upstream the fetch can hang for minutes. Before this guard, every request
+# that found the cache cold started its OWN fetch — each one parking a thread
+# — and the Paper page's auto-refresh kept stacking them until the pool was
+# exhausted and the whole API hung. Now at most one fetch is ever in flight
+# (on the quote pool), and request paths wait a bounded few seconds for it
+# before falling back to whatever is cached (names degrade to blank).
 _NAME_MAP: dict[str, str] = {}
 _NAME_MAP_EXPIRES = 0.0
 _NAME_MAP_LOCK = threading.Lock()
 _NAME_MAP_TTL_SEC = 6 * 3600.0
+_NAME_MAP_FETCH: Optional["FutureLike"] = None  # in-flight single-flight future
+_NAME_MAP_WAIT_SEC = 3.0
+
+FutureLike = Any  # concurrent.futures.Future; alias keeps the annotation light
 
 
-def _name_map() -> dict[str, str]:
-    """Cached ``{6-digit code: name}`` for the whole A-share market.
-
-    Best-effort: on fetch failure returns whatever is cached (possibly empty)
-    so the name column just degrades to blank rather than failing the page.
-    """
+def _fetch_name_map_upstream() -> dict[str, str]:
+    """The actual AKShare call — runs on the quote pool, possibly for a while."""
     global _NAME_MAP_EXPIRES
-    now = time.monotonic()
-    with _NAME_MAP_LOCK:
-        if _NAME_MAP and now < _NAME_MAP_EXPIRES:
-            return _NAME_MAP
     try:
         import tradingagents.dataflows  # noqa: F401 — NO_PROXY bootstrap
         import akshare as ak
@@ -111,8 +117,31 @@ def _name_map() -> dict[str, str]:
         if fresh:
             _NAME_MAP.clear()
             _NAME_MAP.update(fresh)
-            _NAME_MAP_EXPIRES = now + _NAME_MAP_TTL_SEC
-        return _NAME_MAP
+            _NAME_MAP_EXPIRES = time.monotonic() + _NAME_MAP_TTL_SEC
+        return dict(_NAME_MAP)
+
+
+def _name_map(wait_sec: float = _NAME_MAP_WAIT_SEC) -> dict[str, str]:
+    """Cached ``{6-digit code: name}`` for the whole A-share market.
+
+    Fresh cache → returned immediately. Stale/cold cache → ensures ONE
+    background refresh is running on the quote pool and waits at most
+    ``wait_sec`` for it; on timeout returns the stale/empty cache so the
+    caller's request can't hang on a dead upstream.
+    """
+    global _NAME_MAP_FETCH
+    now = time.monotonic()
+    with _NAME_MAP_LOCK:
+        if _NAME_MAP and now < _NAME_MAP_EXPIRES:
+            return dict(_NAME_MAP)
+        if _NAME_MAP_FETCH is None or _NAME_MAP_FETCH.done():
+            _NAME_MAP_FETCH = quote_executor.submit(_fetch_name_map_upstream)
+        fetch = _NAME_MAP_FETCH
+    try:
+        return fetch.result(timeout=wait_sec)
+    except (FutureTimeout, Exception):  # noqa: BLE001 — degrade, never block
+        with _NAME_MAP_LOCK:
+            return dict(_NAME_MAP)
 
 
 def _name_map_cached_only() -> dict[str, str]:
@@ -127,10 +156,15 @@ def _name_map_cached_only() -> dict[str, str]:
 
 
 def _resolve_name(ticker: str) -> Optional[str]:
-    """Best-effort display name for a ticker; None for non-A-share / unknown."""
+    """Best-effort display name for a ticker; None for non-A-share / unknown.
+
+    Pure cache lookup — never fetches. Callers that want names should warm the
+    map first via ``_name_map()`` on the quote pool; this keeps _resolve_name
+    safe to call from the event loop thread.
+    """
     digits = re.sub(r"\D", "", ticker or "")
     if len(digits) >= 6:
-        return _name_map().get(digits[-6:])
+        return _name_map_cached_only().get(digits[-6:])
     return None
 
 
@@ -310,11 +344,15 @@ def _fetch_spot_price(ticker: str) -> Optional[float]:
 
 
 def _fetch_last_price_uncached(ticker: str) -> Optional[float]:
-    # Prefer the fast, un-throttled live quote; only fall back to the heavier
-    # kline path (route_to_vendor) when all spot endpoints fail.
-    spot = _fetch_spot_price(ticker)
-    if spot is not None:
-        return spot
+    # Prefer the fast, un-throttled live quote (each vendor has a 4 s timeout,
+    # so this path is bounded). For A-share tickers, all three spot endpoints
+    # failing means the CN feeds are down/blocked — the AKShare kline fallback
+    # hits the same upstreams with NO timeout and would just hang a worker for
+    # minutes, so we skip it and let the price degrade to "—". Non-A-share
+    # tickers never had a spot path; they go straight to the kline chain
+    # (yfinance, which enforces its own request timeouts).
+    if _spot_secid(ticker) is not None:
+        return _fetch_spot_price(ticker)
 
     from tradingagents.dataflows.interface import route_to_vendor
 
@@ -558,12 +596,13 @@ async def positions(with_prices: bool = True):
                  for p in positions]
         return {"items": items, "total": len(items)}
 
-    # Warm the name map once off-loop; decorate() then does cheap dict lookups.
-    await loop.run_in_executor(None, _name_map)
+    # Warm the name map once off-loop (bounded single-flight wait inside);
+    # decorate() then does cheap dict lookups.
+    await loop.run_in_executor(quote_executor, _name_map)
 
     async def decorate(p):
         name = _resolve_name(p["ticker"])
-        last = await loop.run_in_executor(None, _fetch_last_price_sync, p["ticker"])
+        last = await loop.run_in_executor(quote_executor, _fetch_last_price_sync, p["ticker"])
         if last is None:
             return {**p, "name": name, "last_price": None, "market_value": None,
                     "pnl_amount": None, "pnl_pct": None}
@@ -605,7 +644,9 @@ async def orders():
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     items = await loop.run_in_executor(None, db.list_paper_orders, acct["id"], 200)
-    await loop.run_in_executor(None, _name_map)  # warm cache off-loop
+    # Warm the name cache on the quote pool — single-flight with a bounded
+    # wait, so a dead upstream costs ~3 s once, not a hung request per call.
+    await loop.run_in_executor(quote_executor, _name_map)
     items = [{**o, "name": _resolve_name(o["ticker"])} for o in items]
     return {"items": items, "total": len(items)}
 
@@ -616,7 +657,7 @@ async def place_order(req: PaperOrderRequest):
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     price = req.price
     if price is None:
-        price = await loop.run_in_executor(None, _fetch_last_price_sync, req.ticker)
+        price = await loop.run_in_executor(quote_executor, _fetch_last_price_sync, req.ticker)
     if price is None or price <= 0:
         raise HTTPException(
             status_code=400, detail="无法获取价格，请手动指定 price",
@@ -672,7 +713,7 @@ async def order_from_decision(req: PaperOrderFromDecision):
     price = req.price or parsed["entry_price"]
     if price is None or price <= 0:
         price = await loop.run_in_executor(
-            None, _fetch_last_price_sync, analysis["ticker"],
+            quote_executor, _fetch_last_price_sync, analysis["ticker"],
         )
     if price is None or price <= 0:
         raise HTTPException(status_code=400, detail="无法解析价格，请手动指定 price")
@@ -745,8 +786,10 @@ async def take_snapshot():
     """
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
+    # Marks-to-market via per-position quote fetches → quote pool, not the
+    # default executor that serves request-path DB calls.
     return await loop.run_in_executor(
-        None, compute_and_store_nav_snapshot, acct["id"],
+        quote_executor, compute_and_store_nav_snapshot, acct["id"],
     )
 
 

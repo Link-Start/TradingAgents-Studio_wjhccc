@@ -2,6 +2,7 @@
 # Original: github.com/TauricResearch/TradingAgents (Apache License 2.0)
 
 from tradingagents.agents.utils.agent_utils import get_language_instruction
+from tradingagents.agents.utils.debate_utils import clip_report, recent_history
 
 
 def create_bear_researcher(llm):
@@ -11,14 +12,14 @@ def create_bear_researcher(llm):
         bear_history = investment_debate_state.get("bear_history", "")
 
         current_response = investment_debate_state.get("current_response", "")
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
-        cn_sentiment_report = state.get("cn_sentiment_report", "")
-        event_impact_report = state.get("event_impact_report", "")
-        capital_flow_report = state.get("capital_flow_report", "")
-        macro_report = state.get("macro_report", "")
+        market_research_report = clip_report(state["market_report"])
+        sentiment_report = clip_report(state["sentiment_report"])
+        news_report = clip_report(state["news_report"])
+        fundamentals_report = clip_report(state["fundamentals_report"])
+        cn_sentiment_report = clip_report(state.get("cn_sentiment_report", ""))
+        event_impact_report = clip_report(state.get("event_impact_report", ""))
+        capital_flow_report = clip_report(state.get("capital_flow_report", ""))
+        macro_report = clip_report(state.get("macro_report", ""))
         asset_type = state.get("asset_type", "stock")
         target_label = "stock" if asset_type == "stock" else "asset"
         fundamentals_label = (
@@ -53,7 +54,7 @@ Market research report: {market_research_report}
 Social media sentiment report: {sentiment_report}
 Latest world affairs news: {news_report}
 {fundamentals_label}: {fundamentals_report}{extra_reports}
-Conversation history of the debate: {history}
+Conversation history of the debate: {recent_history(history)}
 Last bull argument: {current_response}
 Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the {target_label}.
 """ + get_language_instruction()

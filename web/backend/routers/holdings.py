@@ -18,6 +18,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException
 
 from .. import database as db
+from ..executors import quote_executor
 from ..models import HoldingCreate, HoldingUpdate, HoldingsImport
 
 logger = logging.getLogger(__name__)
@@ -30,12 +31,12 @@ async def list_all():
     """Return every holding, annotated with the latest analysis signal."""
     loop = asyncio.get_running_loop()
     holdings = await loop.run_in_executor(None, db.list_holdings)
-    # Decorate with last analysis signal — cheap (1 query per ticker, indexed).
+    # Decorate with last analysis signal — one batched query for all tickers.
+    signals = await loop.run_in_executor(
+        None, db.latest_signals_for_tickers, [h["ticker"] for h in holdings],
+    )
     for h in holdings:
-        latest = await loop.run_in_executor(
-            None, db.latest_signal_for_ticker, h["ticker"],
-        )
-        h["latest_analysis"] = latest
+        h["latest_analysis"] = signals.get(h["ticker"])
     return {"items": holdings, "total": len(holdings)}
 
 
@@ -150,7 +151,7 @@ async def quote(holding_id: int):
         raise HTTPException(status_code=404, detail="holding not found")
 
     last_price, prev_close = await loop.run_in_executor(
-        None, _fetch_last_price, holding["ticker"],
+        quote_executor, _fetch_last_price, holding["ticker"],
     )
     pnl = _compute_pnl(holding, last_price)
     return {

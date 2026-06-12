@@ -107,6 +107,15 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    # Debate prompt budgets. Every debate turn re-sends the analyst reports
+    # and the running transcript, so without a cap the per-turn input grows
+    # quadratically with rounds. Each report fed to a debater is clipped to
+    # ``debate_report_max_chars`` characters, and the transcript is windowed
+    # to the last ``debate_history_max_turns`` turns (each side's full
+    # position survives in its own history; the Research Manager judge still
+    # sees the complete transcript). Set either to 0 to disable.
+    "debate_report_max_chars": 4000,
+    "debate_history_max_turns": 6,
     # Max analysts running concurrently inside the parallel analyst step.
     # 0 = no cap (run every selected analyst at once). The process-wide LLM
     # semaphore (TRADINGAGENTS_LLM_CONCURRENCY) is the real ceiling that keeps

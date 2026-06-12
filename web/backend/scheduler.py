@@ -381,10 +381,11 @@ class SchedulerService:
             return
         loop = asyncio.get_running_loop()
         try:
+            from .executors import quote_executor
             from .routers.paper import compute_and_store_nav_snapshot
             acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
             snap = await loop.run_in_executor(
-                None, compute_and_store_nav_snapshot, acct["id"],
+                quote_executor, compute_and_store_nav_snapshot, acct["id"],
             )
             self._last_nav_date = today
             logger.info("Daily NAV snapshot stored: %s total=%s", today, snap["total_value"])
@@ -495,10 +496,12 @@ class SchedulerService:
     async def _auto_trade(self, schedule: dict, analysis_id: str):
         loop = asyncio.get_running_loop()
         try:
+            from .executors import quote_executor
             from .routers.paper import execute_auto_trade
             frac = schedule.get("auto_trade_cash_fraction") or 0.1
+            # Fetches market snapshots internally → quote pool.
             order, reason = await loop.run_in_executor(
-                None,
+                quote_executor,
                 lambda: execute_auto_trade(analysis_id, cash_fraction=float(frac)),
             )
             logger.info(
