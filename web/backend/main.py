@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db, fail_stale_runs, checkpoint_sqlite
 from .executors import shutdown as shutdown_heavy_executor
-from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen, quality
+from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen, quality, screen_schedule
 from .scheduler import service as scheduler_service
 
 # Keep the log file inside the writable ~/.tradingagents home (override with
@@ -115,6 +115,7 @@ app.include_router(paper.router)
 app.include_router(quote.router)
 app.include_router(backtest.router)
 app.include_router(screen.router)
+app.include_router(screen_schedule.router)
 app.include_router(quality.router)
 
 

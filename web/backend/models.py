@@ -126,6 +126,65 @@ class ScheduleFromHoldings(BaseModel):
     auto_trade_cash_fraction: Optional[float] = 0.1
 
 
+class ScreenScheduleCreate(BaseModel):
+    """Create a recurring screen that auto-maintains a rotating analysis pool.
+
+    The screen itself runs on a slow cadence (``daily``/``weekly`` only — pool
+    rotation isn't an intraday concern). Each fire re-screens and reconciles:
+    new hits get a child analysis schedule, persistent misses are evicted after
+    ``evict_after_misses`` consecutive misses, held names are protected.
+
+    ``sub_*`` fields configure the child analysis schedules this screen creates
+    (how often each selected ticker is analysed).
+    """
+    name: Optional[str] = None
+    # --- screen definition (mirrors ScreenRequest) ---
+    text: str = ""
+    filters: Optional[dict] = None
+    top_n: int = 20
+    use_llm: bool = True
+    asset_type: str = "stock"
+    # --- when the screen runs ---
+    schedule_type: str = "daily"  # 'daily' | 'weekly'
+    time_of_day: Optional[str] = "09:20"  # "HH:MM"
+    day_of_week: Optional[int] = None  # 0=Mon..6=Sun (weekly only)
+    # --- child analysis schedule config ---
+    analysts: list[str] = ["market", "news", "fundamentals"]
+    sub_schedule_type: str = "daily"  # 'interval' | 'daily' | 'weekly'
+    sub_interval_minutes: Optional[int] = None
+    sub_time_of_day: Optional[str] = "09:35"
+    sub_day_of_week: Optional[int] = None
+    max_debate_rounds: int = 1
+    max_risk_discuss_rounds: int = 1
+    output_language: Optional[str] = None
+    # --- rotation params ---
+    evict_after_misses: int = 3
+    max_pool_size: Optional[int] = None  # None ⇒ unbounded
+    auto_trade: bool = False
+    auto_trade_cash_fraction: Optional[float] = 0.1
+
+
+class ScreenScheduleUpdate(BaseModel):
+    name: Optional[str] = None
+    text: Optional[str] = None
+    filters: Optional[dict] = None
+    top_n: Optional[int] = None
+    use_llm: Optional[bool] = None
+    asset_type: Optional[str] = None
+    schedule_type: Optional[str] = None
+    time_of_day: Optional[str] = None
+    day_of_week: Optional[int] = None
+    sub_schedule_type: Optional[str] = None
+    sub_interval_minutes: Optional[int] = None
+    sub_time_of_day: Optional[str] = None
+    sub_day_of_week: Optional[int] = None
+    evict_after_misses: Optional[int] = None
+    max_pool_size: Optional[int] = None
+    auto_trade: Optional[bool] = None
+    auto_trade_cash_fraction: Optional[float] = None
+    status: Optional[str] = None  # 'active' | 'disabled'
+
+
 class PaperOrderRequest(BaseModel):
     """Place a paper-trading order.
 

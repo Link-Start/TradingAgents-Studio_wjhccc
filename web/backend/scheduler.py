@@ -55,6 +55,10 @@ _MAX_CONCURRENT_RUNS = 3
 # its in-flight slot rather than letting it block that schedule forever.
 _RUN_TIMEOUT_SEC = 20 * 60
 
+# A screen-schedule reconcile (one market-wide screen + pool diff) is much
+# cheaper than a deep analysis; cap it well below the analysis timeout.
+_SCREEN_RECONCILE_TIMEOUT_SEC = 5 * 60
+
 
 def _now_iso() -> str:
     """Server-local ISO timestamp (no timezone marker)."""
@@ -262,6 +266,10 @@ class SchedulerService:
         # Last date (YYYY-MM-DD, server-local) we stored a NAV snapshot, so the
         # daily auto-snapshot fires at most once per calendar day.
         self._last_nav_date: Optional[str] = None
+        # Screen-schedule ids currently reconciling, so a slow screen doesn't
+        # get re-fired on the next tick. Separate from _in_flight because both
+        # key spaces are small ints and would otherwise collide.
+        self._screen_in_flight: dict[int, datetime] = {}
         # Strong refs to fire-and-forget run tasks. asyncio only holds a weak
         # ref to a bare create_task() result, so without this the GC can drop a
         # mid-flight run. Tasks remove themselves on completion.
@@ -369,9 +377,72 @@ class SchedulerService:
             self._in_flight[sid] = now
             self._spawn(self._fire_scheduled(s))
 
+        # Screen schedules: re-run a saved screen and reconcile its rotating
+        # pool of analysis schedules. Slow cadence (daily/weekly), so off-hours
+        # catch-up is harmless — we just run whenever one comes due.
+        await self._tick_screen_schedules(loop, now_iso, now)
+
         # Daily NAV snapshot — once per day, after market close, so the paper
         # account's equity curve updates on its own.
         await self._maybe_snapshot_nav(now)
+
+    async def _tick_screen_schedules(self, loop, now_iso: str, now: datetime):
+        screens = await loop.run_in_executor(None, db.due_screen_schedules, now_iso)
+        # Watchdog for wedged reconciles (mirrors the analysis-slot backstop).
+        for sid, started in list(self._screen_in_flight.items()):
+            if (now - started).total_seconds() > _SCREEN_RECONCILE_TIMEOUT_SEC + 60:
+                logger.warning("Screen schedule %s: reconcile slot stuck, reclaiming", sid)
+                self._screen_in_flight.pop(sid, None)
+        for ss in screens:
+            sid = ss["id"]
+            if sid in self._screen_in_flight:
+                continue
+            # Skip ancient missed fires — bump next_run_at forward and move on.
+            try:
+                gap = (now - _parse_iso(ss["next_run_at"])).total_seconds()
+            except Exception:
+                gap = 0
+            if gap > _MAX_CATCH_UP_SECONDS:
+                nxt = compute_next_run_at(
+                    ss["schedule_type"], None, ss.get("time_of_day"),
+                    ss.get("day_of_week"), ref=now,
+                )
+                await loop.run_in_executor(
+                    None, lambda i=sid, n=nxt: db.update_screen_schedule(i, next_run_at=n),
+                )
+                continue
+            self._screen_in_flight[sid] = now
+            self._spawn(self._fire_screen_schedule(ss))
+
+    async def _fire_screen_schedule(self, ss: dict):
+        """Reconcile one screen schedule and advance its recurrence state."""
+        from . import screen_schedule_runner
+        sid = ss["id"]
+        try:
+            next_run = compute_next_run_at(
+                ss["schedule_type"], None, ss.get("time_of_day"), ss.get("day_of_week"),
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: db.update_screen_schedule(sid, next_run_at=next_run),
+            )
+            try:
+                success = await asyncio.wait_for(
+                    screen_schedule_runner.reconcile(ss),
+                    timeout=_SCREEN_RECONCILE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Screen schedule %s: reconcile timed out", sid)
+                success = False
+            await loop.run_in_executor(
+                None,
+                lambda: db.record_screen_schedule_fire(
+                    sid, success=success, next_run_at=next_run,
+                    auto_disable_after=_AUTO_DISABLE_AFTER,
+                ),
+            )
+        finally:
+            self._screen_in_flight.pop(sid, None)
 
     async def _maybe_snapshot_nav(self, now: datetime):
         today = now.strftime("%Y-%m-%d")
@@ -404,6 +475,19 @@ class SchedulerService:
             await loop.run_in_executor(
                 None, lambda: db.update_schedule(sid, next_run_at=next_run),
             )
+            # Same-day-buy gate: if this ticker was bought (paper) today, skip
+            # today's scheduled analysis — a freshly opened position only needs
+            # re-evaluating from the next trading day (when a sell might matter).
+            # next_run_at is already advanced above, so it resumes tomorrow.
+            bought_today = await loop.run_in_executor(
+                None, lambda: db.has_buy_filled_today(schedule["ticker"]),
+            )
+            if bought_today:
+                logger.info(
+                    "Schedule %s (%s): skipped — bought today, resumes %s",
+                    sid, schedule["ticker"], next_run,
+                )
+                return
             analysis_id = str(uuid.uuid4())
             # Throttle: only _MAX_CONCURRENT_RUNS analyses run at once; the rest
             # wait here. Timeout guards against a single run hanging forever.

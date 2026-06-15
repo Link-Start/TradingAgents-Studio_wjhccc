@@ -49,6 +49,9 @@
         <n-button size="small" secondary type="info" @click="openHistory">
           📋 {{ historyItems.length ? t('screener.historyCount', { n: historyItems.length }) : t('screener.history') }}
         </n-button>
+        <n-button size="small" secondary type="success" @click="showSaveScreen = true">
+          ⏰ {{ t('screenSchedule.saveFromScreener') }}
+        </n-button>
       </n-space>
 
       <!-- Advanced filters -->
@@ -181,6 +184,44 @@
           <n-button type="warning" :loading="addingSchedule" @click="confirmAutoTrade">
             {{ t('screener.autoTradeConfirm') }}
           </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
+
+    <!-- Save the current screen as a recurring screen schedule (auto-rotating pool) -->
+    <n-modal v-model:show="showSaveScreen" preset="card" :title="t('screenSchedule.createTitle')" style="width: 480px">
+      <n-space vertical :size="16">
+        <n-text depth="3" style="font-size: 12px">{{ t('screenSchedule.sectionDesc') }}</n-text>
+        <n-form-item :label="t('screenSchedule.fields.goal')" label-placement="top">
+          <n-input v-model:value="saveScreenGoal" type="textarea" :autosize="{ minRows: 1, maxRows: 3 }" :placeholder="t('screenSchedule.fields.goalPlaceholder')" />
+        </n-form-item>
+        <n-form-item :label="t('screenSchedule.fields.screenCadence')" label-placement="top">
+          <n-space align="center">
+            <n-radio-group v-model:value="saveScreenType">
+              <n-radio value="daily">{{ t('screenSchedule.cadence.daily') }}</n-radio>
+              <n-radio value="weekly">{{ t('screenSchedule.cadence.weekly') }}</n-radio>
+            </n-radio-group>
+            <n-time-picker v-model:formatted-value="saveScreenTime" format="HH:mm" value-format="HH:mm" />
+          </n-space>
+        </n-form-item>
+        <n-form-item :label="t('screenSchedule.fields.subCadence')" label-placement="top">
+          <n-space align="center">
+            <n-radio-group v-model:value="saveSubType">
+              <n-radio value="interval">{{ t('screenSchedule.cadence.interval') }}</n-radio>
+              <n-radio value="daily">{{ t('screenSchedule.cadence.daily') }}</n-radio>
+            </n-radio-group>
+            <n-input-number v-if="saveSubType === 'interval'" v-model:value="saveSubInterval" :min="5" :step="5" style="width: 120px">
+              <template #suffix>{{ t('screener.minutes') }}</template>
+            </n-input-number>
+            <n-time-picker v-else v-model:formatted-value="saveSubTime" format="HH:mm" value-format="HH:mm" />
+          </n-space>
+        </n-form-item>
+        <n-form-item :label="t('screenSchedule.fields.evictAfter')" label-placement="top">
+          <n-input-number v-model:value="saveEvictAfter" :min="1" :max="20" style="width: 120px" />
+        </n-form-item>
+        <n-space justify="end">
+          <n-button @click="showSaveScreen = false">{{ t('common.cancel') }}</n-button>
+          <n-button type="success" :loading="savingScreen" @click="confirmSaveScreen">{{ t('common.save') }}</n-button>
         </n-space>
       </n-space>
     </n-modal>
@@ -563,6 +604,50 @@ async function confirmAutoTrade() {
     message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
   } finally {
     addingSchedule.value = false
+  }
+}
+
+// --- save current screen as a recurring screen schedule ---
+const showSaveScreen = ref(false)
+const savingScreen = ref(false)
+const saveScreenGoal = ref('')
+const saveScreenType = ref<'daily' | 'weekly'>('daily')
+const saveScreenTime = ref<string | null>('09:20')
+const saveSubType = ref<'interval' | 'daily'>('daily')
+const saveSubInterval = ref(60)
+const saveSubTime = ref<string | null>('09:35')
+const saveEvictAfter = ref(3)
+
+watch(showSaveScreen, (open) => {
+  // Prefill the goal from the current screener input when the modal opens.
+  if (open && !saveScreenGoal.value) saveScreenGoal.value = goal.value
+})
+
+async function confirmSaveScreen() {
+  const text = (saveScreenGoal.value || goal.value || '').trim()
+  if (!text) { message.warning(t('screenSchedule.validation.noScreen')); return }
+  savingScreen.value = true
+  try {
+    const f = cleanFilters()
+    await api.post('/api/screen-schedules', {
+      text,
+      filters: Object.keys(f).length ? f : null,
+      top_n: topN.value,
+      use_llm: useLlm.value,
+      schedule_type: saveScreenType.value,
+      time_of_day: saveScreenTime.value || '09:20',
+      sub_schedule_type: saveSubType.value,
+      sub_interval_minutes: saveSubType.value === 'interval' ? saveSubInterval.value : null,
+      sub_time_of_day: saveSubType.value !== 'interval' ? (saveSubTime.value || '09:35') : null,
+      evict_after_misses: saveEvictAfter.value,
+    })
+    showSaveScreen.value = false
+    message.success(t('screenSchedule.msg.created'))
+    router.push('/schedule')
+  } catch (e: any) {
+    message.error(t('screenSchedule.msg.saveFailed') + (e?.response?.data?.detail || e?.message || t('common.failed')))
+  } finally {
+    savingScreen.value = false
   }
 }
 

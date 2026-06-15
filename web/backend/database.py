@@ -134,6 +134,54 @@ Table(
     Column("updated_at", String(40), nullable=False),
     Index("idx_schedules_next", "next_run_at", "status"),
     Index("idx_schedules_ticker", "ticker"),
+    # Auto-rotation bookkeeping (added via ALTER for pre-existing DBs in init_db):
+    #   source_screen_schedule_id — which screen_schedule auto-created this row
+    #     (NULL = user-/holdings-created, never auto-managed).
+    #   miss_count — consecutive screens that DIDN'T re-select this ticker; the
+    #     screen scheduler evicts the row once it reaches evict_after_misses.
+    Column("source_screen_schedule_id", Integer),
+    Column("miss_count", Integer, nullable=False, server_default=text("0")),
+)
+
+# A recurring stock-screen that auto-maintains a rotating pool of analysis
+# ``schedules``. Each fire re-runs the screener and reconciles the pool: new
+# hits get a child schedule (source_screen_schedule_id = this id), persistent
+# misses are evicted, held tickers are protected. See screen_schedule_runner.
+Table(
+    "screen_schedules", _METADATA,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String(255)),
+    # --- screen definition (mirrors ScreenRequest) ---
+    Column("text", Text),
+    Column("filters_json", _BigText),
+    Column("top_n", Integer, nullable=False, server_default=text("20")),
+    Column("use_llm", Integer, nullable=False, server_default=text("0")),
+    Column("asset_type", String(16), nullable=False, server_default=text("'stock'")),
+    # --- when the screen itself runs (daily/weekly only — rotation is slow) ---
+    Column("schedule_type", String(24), nullable=False),
+    Column("time_of_day", String(16)),
+    Column("day_of_week", Integer),
+    # --- config for the child analysis schedules this screen creates ---
+    Column("analysts_json", Text, nullable=False),
+    Column("sub_schedule_type", String(24), nullable=False, server_default=text("'daily'")),
+    Column("sub_interval_minutes", Integer),
+    Column("sub_time_of_day", String(16)),
+    Column("sub_day_of_week", Integer),
+    Column("sub_config_json", _BigText, nullable=False),
+    # --- rotation params ---
+    Column("evict_after_misses", Integer, nullable=False, server_default=text("3")),
+    Column("max_pool_size", Integer),
+    Column("auto_trade", Integer, nullable=False, server_default=text("0")),
+    Column("auto_trade_cash_fraction", Float),
+    # --- recurrence bookkeeping (mirrors schedules) ---
+    Column("status", String(16), nullable=False, server_default=text("'active'")),
+    Column("fail_count", Integer, nullable=False, server_default=text("0")),
+    Column("last_run_at", String(40)),
+    Column("last_screen_run_id", String(64)),
+    Column("next_run_at", String(40), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Index("idx_screen_schedules_next", "next_run_at", "status"),
 )
 
 Table(
@@ -460,6 +508,12 @@ def init_db():
         if "auto_trade_cash_fraction" not in cols:
             conn.execute(text(
                 "ALTER TABLE schedules ADD COLUMN auto_trade_cash_fraction REAL"))
+        if "source_screen_schedule_id" not in cols:
+            conn.execute(text(
+                "ALTER TABLE schedules ADD COLUMN source_screen_schedule_id INTEGER"))
+        if "miss_count" not in cols:
+            conn.execute(text(
+                "ALTER TABLE schedules ADD COLUMN miss_count INTEGER NOT NULL DEFAULT 0"))
         a_cols = {c["name"] for c in sa_inspect(conn).get_columns("analyses")}
         for col in ("tokens_in", "tokens_out", "llm_calls"):
             if col not in a_cols:
@@ -844,6 +898,7 @@ def create_schedule(
     from_holding: bool = False,
     auto_trade: bool = False,
     auto_trade_cash_fraction: Optional[float] = None,
+    source_screen_schedule_id: Optional[int] = None,
 ) -> dict:
     now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
@@ -851,12 +906,12 @@ def create_schedule(
             "INSERT INTO schedules (name, ticker, asset_type, schedule_type, "
             "interval_minutes, time_of_day, day_of_week, analysts, config_json, "
             "next_run_at, from_holding, auto_trade, auto_trade_cash_fraction, "
-            "created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source_screen_schedule_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, ticker, asset_type, schedule_type, interval_minutes, time_of_day,
              day_of_week, json.dumps(analysts), json.dumps(config), next_run_at,
              1 if from_holding else 0, 1 if auto_trade else 0,
-             auto_trade_cash_fraction, now, now),
+             auto_trade_cash_fraction, source_screen_schedule_id, now, now),
         )
         sid = cur.lastrowid
         row = conn.execute("SELECT * FROM schedules WHERE id = ?", (sid,)).fetchone()
@@ -891,6 +946,7 @@ def update_schedule(schedule_id: int, **fields) -> Optional[dict]:
         "name", "schedule_type", "interval_minutes", "time_of_day", "day_of_week",
         "analysts", "config_json", "status", "next_run_at", "last_run_at",
         "last_analysis_id", "fail_count", "auto_trade", "auto_trade_cash_fraction",
+        "miss_count",
     }
     cols, vals = [], []
     for k, v in fields.items():
@@ -955,6 +1011,204 @@ def record_schedule_fire(
             "UPDATE schedules SET fail_count = ?, status = ?, last_run_at = ?, "
             "last_analysis_id = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
             (new_fail, new_status, now, analysis_id, next_run_at, now, schedule_id),
+        )
+
+
+def list_schedules_by_source(screen_schedule_id: int) -> list:
+    """Analysis schedules auto-created by a given screen_schedule (its pool)."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedules WHERE source_screen_schedule_id = ? "
+            "ORDER BY ticker",
+            (screen_schedule_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_buy_filled_today(ticker: str, today: Optional[str] = None) -> bool:
+    """True if ``ticker`` has a paper buy order filled today (server-local).
+
+    Used to skip a same-day re-analysis of a freshly bought name — it only
+    needs re-evaluating from the next trading day onward (might need a sell).
+    ``filled_at`` is stored as a UTC ISO string; we match on the date prefix
+    passed in (caller supplies a server-local YYYY-MM-DD)."""
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM paper_orders WHERE ticker = ? AND action = 'buy' "
+            "AND filled_at LIKE ? LIMIT 1",
+            (ticker, day + "%"),
+        ).fetchone()
+    return row is not None
+
+
+# --- Screen schedules (auto-rotating analysis pool) ---
+
+def create_screen_schedule(
+    *,
+    name: Optional[str],
+    text: Optional[str],
+    filters: Optional[dict],
+    top_n: int,
+    use_llm: bool,
+    asset_type: str,
+    schedule_type: str,
+    time_of_day: Optional[str],
+    day_of_week: Optional[int],
+    analysts: list,
+    sub_schedule_type: str,
+    sub_interval_minutes: Optional[int],
+    sub_time_of_day: Optional[str],
+    sub_day_of_week: Optional[int],
+    sub_config: dict,
+    evict_after_misses: int,
+    max_pool_size: Optional[int],
+    auto_trade: bool,
+    auto_trade_cash_fraction: Optional[float],
+    next_run_at: str,
+) -> dict:
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO screen_schedules (name, text, filters_json, top_n, "
+            "use_llm, asset_type, schedule_type, time_of_day, day_of_week, "
+            "analysts_json, sub_schedule_type, sub_interval_minutes, "
+            "sub_time_of_day, sub_day_of_week, sub_config_json, "
+            "evict_after_misses, max_pool_size, auto_trade, "
+            "auto_trade_cash_fraction, next_run_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, text, json.dumps(filters or {}), top_n, 1 if use_llm else 0,
+             asset_type, schedule_type, time_of_day, day_of_week,
+             json.dumps(analysts), sub_schedule_type, sub_interval_minutes,
+             sub_time_of_day, sub_day_of_week, json.dumps(sub_config),
+             evict_after_misses, max_pool_size, 1 if auto_trade else 0,
+             auto_trade_cash_fraction, next_run_at, now, now),
+        )
+        sid = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM screen_schedules WHERE id = ?", (sid,)
+        ).fetchone()
+    return dict(row)
+
+
+def list_screen_schedules(status: Optional[str] = None) -> list:
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM screen_schedules WHERE status = ? ORDER BY next_run_at",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM screen_schedules ORDER BY status, next_run_at"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_screen_schedule(screen_schedule_id: int) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM screen_schedules WHERE id = ?", (screen_schedule_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_screen_schedule(screen_schedule_id: int, **fields) -> Optional[dict]:
+    """Update mutable fields on a screen schedule. Unknown/None keys ignored.
+
+    JSON-typed keys (filters, analysts, sub_config) accept python objects and
+    are serialised here; pass them under their python names (``filters`` etc.)."""
+    json_map = {"filters": "filters_json", "analysts": "analysts_json",
+                "sub_config": "sub_config_json"}
+    allowed = {
+        "name", "text", "top_n", "use_llm", "asset_type", "schedule_type",
+        "time_of_day", "day_of_week", "sub_schedule_type", "sub_interval_minutes",
+        "sub_time_of_day", "sub_day_of_week", "evict_after_misses", "max_pool_size",
+        "auto_trade", "auto_trade_cash_fraction", "status", "fail_count",
+        "last_run_at", "last_screen_run_id", "next_run_at",
+        "filters_json", "analysts_json", "sub_config_json",
+    }
+    cols, vals = [], []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if k in json_map:
+            cols.append(f"{json_map[k]} = ?")
+            vals.append(json.dumps(v))
+            continue
+        if k not in allowed:
+            continue
+        if k in ("use_llm", "auto_trade"):
+            v = 1 if v else 0
+        cols.append(f"{k} = ?")
+        vals.append(v)
+    if not cols:
+        return get_screen_schedule(screen_schedule_id)
+    cols.append("updated_at = ?")
+    vals.append(datetime.utcnow().isoformat() + "Z")
+    vals.append(screen_schedule_id)
+    with get_db() as conn:
+        conn.execute(
+            f"UPDATE screen_schedules SET {', '.join(cols)} WHERE id = ?", vals,
+        )
+    return get_screen_schedule(screen_schedule_id)
+
+
+def delete_screen_schedule(screen_schedule_id: int, *, cascade: bool = False):
+    """Delete a screen schedule. With ``cascade``, also delete the analysis
+    schedules it auto-created (its managed pool)."""
+    with get_db() as conn:
+        if cascade:
+            conn.execute(
+                "DELETE FROM schedules WHERE source_screen_schedule_id = ?",
+                (screen_schedule_id,),
+            )
+        conn.execute(
+            "DELETE FROM screen_schedules WHERE id = ?", (screen_schedule_id,)
+        )
+
+
+def due_screen_schedules(now_iso: str) -> list:
+    """Active screen schedules whose next_run_at is at or before ``now_iso``."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM screen_schedules WHERE status = 'active' "
+            "AND next_run_at <= ? ORDER BY next_run_at",
+            (now_iso,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_screen_schedule_fire(
+    screen_schedule_id: int,
+    *,
+    success: bool,
+    next_run_at: str,
+    screen_run_id: Optional[str] = None,
+    auto_disable_after: int = 3,
+):
+    """Update a screen schedule after a reconcile fire. On failure, increment
+    fail_count and auto-disable when it reaches ``auto_disable_after``."""
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_db() as conn:
+        ss = conn.execute(
+            "SELECT fail_count FROM screen_schedules WHERE id = ?",
+            (screen_schedule_id,),
+        ).fetchone()
+        if not ss:
+            return
+        if success:
+            new_fail = 0
+            new_status = "active"
+        else:
+            new_fail = ss["fail_count"] + 1
+            new_status = "disabled" if new_fail >= auto_disable_after else "active"
+        conn.execute(
+            "UPDATE screen_schedules SET fail_count = ?, status = ?, "
+            "last_run_at = ?, last_screen_run_id = ?, next_run_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (new_fail, new_status, now, screen_run_id, next_run_at, now,
+             screen_schedule_id),
         )
 
 
