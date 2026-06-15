@@ -157,8 +157,13 @@ def _fetch_sina(symbol: str, start_date: str, end_date: str):
     import akshare as ak
     import pandas as pd
 
+    from ._v8_guard import V8_LOCK
+
     sina_symbol = _akshare_symbol(symbol)
-    df = ak.stock_zh_a_daily(symbol=sina_symbol, adjust="qfq")
+    # stock_zh_a_daily decrypts via V8 (py_mini_racer) — serialise so two
+    # threads never drive V8 at once (would abort the process).
+    with V8_LOCK:
+        df = ak.stock_zh_a_daily(symbol=sina_symbol, adjust="qfq")
     if df is None or df.empty:
         return df
     # Sina returns the full history; trim to the requested window so the
@@ -187,14 +192,18 @@ def _fetch_tencent(symbol: str, start_date: str, end_date: str):
     import akshare as ak
     import pandas as pd
 
+    from ._v8_guard import V8_LOCK
+
     tencent_symbol = _akshare_symbol(symbol)
-    # AKShare's tencent endpoint expects YYYY-MM-DD strings.
-    df = ak.stock_zh_a_hist_tx(
-        symbol=tencent_symbol,
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq",
-    )
+    # AKShare's tencent endpoint expects YYYY-MM-DD strings. It also decrypts
+    # via V8 (py_mini_racer) — serialise on the shared V8 lock.
+    with V8_LOCK:
+        df = ak.stock_zh_a_hist_tx(
+            symbol=tencent_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
     if df is None or df.empty:
         return df
     rename_map = {
@@ -300,6 +309,9 @@ def _fetch_financial_report(code: str, statement: str):
     with reporting periods as columns.
     """
     import akshare as ak
+
+    from ._v8_guard import V8_LOCK
+
     func_map = {
         "benefit": ak.stock_financial_report_sina,
         "debt": ak.stock_financial_report_sina,
@@ -315,7 +327,11 @@ def _fetch_financial_report(code: str, statement: str):
         "debt": "资产负债表",
         "cash": "现金流量表",
     }[statement]
-    return ak.stock_financial_report_sina(stock=f"sh{code}" if code[0] in "69" else f"sz{code}", symbol=cn_name)
+    # sina financial reports decrypt via V8 — serialise on the shared lock.
+    with V8_LOCK:
+        return ak.stock_financial_report_sina(
+            stock=f"sh{code}" if code[0] in "69" else f"sz{code}", symbol=cn_name,
+        )
 
 
 def get_fundamentals(symbol: str, curr_date: str) -> str:

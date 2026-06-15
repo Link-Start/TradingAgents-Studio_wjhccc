@@ -46,6 +46,15 @@ logger = logging.getLogger("tradingagents.web")
 async def lifespan(app):
     logger.info("Server starting up, initializing database...")
     init_db()
+    # Pre-warm V8 (py_mini_racer) on the main thread BEFORE any worker pool runs
+    # AKShare. Several AKShare endpoints decrypt via V8; if two threads create
+    # their first MiniRacer concurrently, V8 aborts the whole process (the
+    # "every request hangs in pending" symptom). One main-thread init avoids it.
+    try:
+        from tradingagents.dataflows._v8_guard import prewarm_v8
+        prewarm_v8()
+    except Exception:  # noqa: BLE001 — never let this block startup
+        logger.warning("V8 pre-warm unavailable", exc_info=True)
     # Reconcile runs left 'pending'/'running' by a previous crash/reload so the
     # UI doesn't show ghost rows the user can't delete.
     stale = fail_stale_runs()

@@ -205,7 +205,11 @@ def _snap_sina() -> pd.DataFrame:
     Only price/change/amount are available, so value/size filters can't run.
     Marked ``coverage='partial'`` so the runner warns the user.
     """
-    raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot(), label="全市场快照(新浪)", attempts=2, base_sleep=0.5)
+    # stock_zh_a_spot (sina) decrypts via V8 (py_mini_racer) — serialise on the
+    # shared lock so it never races another thread's V8 init/use (would abort).
+    from tradingagents.dataflows._v8_guard import V8_LOCK
+    with V8_LOCK:
+        raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot(), label="全市场快照(新浪)", attempts=2, base_sleep=0.5)
     out = pd.DataFrame()
     out["code"] = raw[_pick(raw, "代码", "symbol")].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
     out["name"] = raw[_pick(raw, "名称", "name")].astype(str)
