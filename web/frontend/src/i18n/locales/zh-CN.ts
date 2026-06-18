@@ -213,6 +213,16 @@ export default {
     recent: '最近分析',
     noRecent: '暂无分析记录',
     signalDist: '信号分布',
+    usage: {
+      title: 'LLM 用量 / 成本',
+      today: '今日 Token',
+      todayCalls: '今日调用',
+      month: '近30天 Token',
+      all: '累计 Token',
+      analysesN: '{n} 次分析',
+      noBudget: '未设日预算',
+      overBudget: '已超预算·定时暂停',
+    },
   },
 
   analyze: {

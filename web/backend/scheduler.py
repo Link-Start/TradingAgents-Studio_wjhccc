@@ -42,6 +42,15 @@ _AUTO_DISABLE_AFTER = 3
 # genuinely duplicate schedule rows for one ticker. 0 disables the gate.
 _DEDUP_ANALYSIS_MINUTES = int(os.getenv("TRADINGAGENTS_DEDUP_ANALYSIS_MINUTES", "30"))
 
+# Daily LLM token budget (in+out across all analyses, local day). When today's
+# usage reaches it, scheduled analyses are paused until tomorrow so a runaway
+# pool can't burn the month's budget overnight. 0 = unlimited.
+_DAILY_TOKEN_BUDGET = lambda: int(os.getenv("TRADINGAGENTS_DAILY_TOKEN_BUDGET", "0") or 0)
+
+# How often the paper-trading risk check (stop-loss/take-profit/daily-loss) runs
+# while the market is open. 0 disables the periodic check entirely.
+_RISK_CHECK_INTERVAL_SEC = int(os.getenv("TRADINGAGENTS_RISK_CHECK_SEC", "300"))
+
 # Don't catch up runs that were missed more than this long ago (e.g. after
 # a multi-day server outage we shouldn't flood the LLM with backfill).
 _MAX_CATCH_UP_SECONDS = 24 * 3600
@@ -273,6 +282,9 @@ class SchedulerService:
         # Last date (YYYY-MM-DD, server-local) we stored a NAV snapshot, so the
         # daily auto-snapshot fires at most once per calendar day.
         self._last_nav_date: Optional[str] = None
+        # Last time the paper risk check (stop-loss/take-profit) ran, to throttle
+        # it to _RISK_CHECK_INTERVAL_SEC instead of every tick.
+        self._last_risk_check: Optional[datetime] = None
         # Screen-schedule ids currently reconciling, so a slow screen doesn't
         # get re-fired on the next tick. Separate from _in_flight because both
         # key spaces are small ints and would otherwise collide.
@@ -393,6 +405,9 @@ class SchedulerService:
         # account's equity curve updates on its own.
         await self._maybe_snapshot_nav(now)
 
+        # Paper-trading risk check — stop-loss / take-profit / daily-loss breaker.
+        await self._maybe_check_risk(now)
+
     async def _tick_screen_schedules(self, loop, now_iso: str, now: datetime):
         screens = await loop.run_in_executor(None, db.due_screen_schedules, now_iso)
         # Watchdog for wedged reconciles (mirrors the analysis-slot backstop).
@@ -470,6 +485,32 @@ class SchedulerService:
         except Exception:
             logger.exception("Daily NAV snapshot failed")
 
+    async def _maybe_check_risk(self, now: datetime):
+        """Run the paper risk check during market hours, throttled to its interval."""
+        if _RISK_CHECK_INTERVAL_SEC <= 0:
+            return
+        from . import risk
+        if not risk.any_enabled():
+            return
+        if (self._last_risk_check
+                and (now - self._last_risk_check).total_seconds() < _RISK_CHECK_INTERVAL_SEC):
+            return
+        # Only meaningful while a session is live (prices move, sells can fill).
+        if not _in_trading_session("stock", now):
+            return
+        self._last_risk_check = now
+        loop = asyncio.get_running_loop()
+        try:
+            from .executors import quote_executor
+            acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
+            res = await loop.run_in_executor(quote_executor, risk.run_risk_check, acct["id"])
+            if res.get("flattened"):
+                logger.info("Risk check flattened %d position(s): %s",
+                            len(res["flattened"]),
+                            ", ".join(f"{x['ticker']}({x['kind']})" for x in res["flattened"]))
+        except Exception:
+            logger.exception("Risk check tick failed")
+
     async def _fire_scheduled(self, schedule: dict):
         """Fire a schedule and advance its state (next_run_at, fail_count)."""
         sid = schedule["id"]
@@ -508,6 +549,19 @@ class SchedulerService:
                     logger.info(
                         "Schedule %s (%s): skipped — analysed <%dm ago, resumes %s",
                         sid, schedule["ticker"], _DEDUP_ANALYSIS_MINUTES, next_run,
+                    )
+                    return
+            # Daily token-budget gate: pause scheduled analyses once today's LLM
+            # usage hits the configured ceiling, so the pool can't blow the budget.
+            budget = _DAILY_TOKEN_BUDGET()
+            if budget > 0:
+                used = await loop.run_in_executor(
+                    None, lambda: db.tokens_used_since(db.local_day_cutoff_utc_iso()),
+                )
+                if used >= budget:
+                    logger.warning(
+                        "Schedule %s (%s): skipped — daily token budget reached (%d/%d), resumes tomorrow",
+                        sid, schedule["ticker"], used, budget,
                     )
                     return
             analysis_id = str(uuid.uuid4())

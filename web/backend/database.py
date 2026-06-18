@@ -1040,6 +1040,71 @@ def list_schedules_by_source(screen_schedule_id: int) -> list:
     return [dict(r) for r in rows]
 
 
+# --- LLM usage / cost accounting ---------------------------------------------
+
+def local_day_cutoff_utc_iso() -> str:
+    """UTC ISO ('...Z') instant of *today's local midnight*.
+
+    ``analyses.created_at`` is stored as naive-UTC ISO with a 'Z'. To sum
+    "today" in the operator's local timezone we convert local midnight into the
+    same UTC string space so a lexicographic ``created_at >= cutoff`` compare is
+    correct. Used by the daily token budget and the usage dashboard.
+    """
+    from datetime import timedelta
+    now_local = datetime.now()
+    offset = now_local - datetime.utcnow()  # ≈ local UTC offset
+    local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (local_midnight - offset).isoformat() + "Z"
+
+
+def tokens_used_since(cutoff_iso: str) -> int:
+    """Total LLM tokens (in+out) across analyses created at/after ``cutoff_iso``."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(tokens_in), 0) + COALESCE(SUM(tokens_out), 0) "
+            "FROM analyses WHERE created_at >= ?",
+            (cutoff_iso,),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def usage_aggregate(cutoff_iso: Optional[str] = None) -> dict:
+    """Token / call / analysis totals, optionally since ``cutoff_iso``."""
+    where = "WHERE created_at >= ?" if cutoff_iso else ""
+    params = (cutoff_iso,) if cutoff_iso else ()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), "
+            "COALESCE(SUM(llm_calls),0), COUNT(*) "
+            f"FROM analyses {where}",
+            params,
+        ).fetchone()
+    tin, tout, calls, n = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0)
+    return {"tokens_in": tin, "tokens_out": tout, "tokens_total": tin + tout,
+            "llm_calls": calls, "analyses": n}
+
+
+def usage_daily_series(cutoff_iso: str) -> list[dict]:
+    """Per-day token totals since ``cutoff_iso`` (UTC date buckets), oldest first."""
+    from collections import defaultdict
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT created_at, tokens_in, tokens_out, llm_calls FROM analyses "
+            "WHERE created_at >= ? ORDER BY created_at",
+            (cutoff_iso,),
+        ).fetchall()
+    by_day: dict[str, dict] = defaultdict(lambda: {"tokens": 0, "calls": 0, "analyses": 0})
+    for r in rows:
+        day = (r["created_at"] or "")[:10]
+        if not day:
+            continue
+        b = by_day[day]
+        b["tokens"] += int(r["tokens_in"] or 0) + int(r["tokens_out"] or 0)
+        b["calls"] += int(r["llm_calls"] or 0)
+        b["analyses"] += 1
+    return [{"date": d, **by_day[d]} for d in sorted(by_day)]
+
+
 def recent_analysis_exists(ticker: str, within_minutes: int = 30) -> bool:
     """True if a non-failed analysis for ``ticker`` was created within the window.
 

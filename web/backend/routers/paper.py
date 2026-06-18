@@ -986,6 +986,13 @@ def execute_auto_trade(
                 shares = lot
             if shares <= 0:
                 return None, "可用现金不足以买入 1 手，跳过"
+            # Risk guards: daily-loss halt, max concurrent positions, max single
+            # position % of equity (resizes down to fit). Off unless configured.
+            from .. import risk
+            shares, guard_reason = risk.buy_guard(
+                acct["id"], positions, price, shares, is_a)
+            if guard_reason:
+                return None, guard_reason
         else:  # sell
             if not pos:
                 return None, f"{ticker} 无持仓可卖，跳过"

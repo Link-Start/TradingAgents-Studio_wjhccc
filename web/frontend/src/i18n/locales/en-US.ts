@@ -213,6 +213,16 @@ export default {
     recent: 'Recent analyses',
     noRecent: 'No analyses yet',
     signalDist: 'Signal distribution',
+    usage: {
+      title: 'LLM usage / cost',
+      today: 'Today tokens',
+      todayCalls: 'Today calls',
+      month: '30-day tokens',
+      all: 'All-time tokens',
+      analysesN: '{n} analyses',
+      noBudget: 'No daily budget',
+      overBudget: 'Over budget · paused',
+    },
   },
 
   analyze: {
