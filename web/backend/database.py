@@ -1040,6 +1040,26 @@ def list_schedules_by_source(screen_schedule_id: int) -> list:
     return [dict(r) for r in rows]
 
 
+def recent_analysis_exists(ticker: str, within_minutes: int = 30) -> bool:
+    """True if a non-failed analysis for ``ticker`` was created within the window.
+
+    Runtime de-dup so two schedules covering the same ticker (e.g. one manual +
+    one from a screen pool) don't both burn a deep analysis when they fire close
+    together — the second sees the first's fresh result and skips. The window is
+    short so a single interval schedule's own cadence (typically hourly) is never
+    blocked. Holdings tracking never triggers analysis, so it can't conflict here.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(minutes=within_minutes)).isoformat() + "Z"
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM analyses WHERE ticker = ? "
+            "AND status IN ('pending', 'running', 'complete') AND created_at >= ? LIMIT 1",
+            (ticker, cutoff),
+        ).fetchone()
+    return row is not None
+
+
 def has_buy_filled_today(ticker: str, today: Optional[str] = None) -> bool:
     """True if ``ticker`` has a paper buy order filled today (server-local).
 

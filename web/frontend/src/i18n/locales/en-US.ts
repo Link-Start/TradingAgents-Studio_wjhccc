@@ -578,6 +578,8 @@ export default {
       sellFailed: 'Sell failed: ',
       flattened: 'Flattened {ticker}',
       flattenFailed: 'Flatten failed: ',
+      toHoldingDone: 'Added {ticker} to holdings tracker',
+      toHoldingExists: '{ticker} is already tracked',
       placed: 'Order filled',
       placeFailed: 'Order failed: ',
       snapshotted: 'NAV snapshot recorded',
@@ -624,6 +626,7 @@ export default {
       sell: 'Sell',
       flatten: 'Flatten',
       kline: 'K-line',
+      toHolding: 'Track as holding',
     },
     orderCols: {
       time: 'Time',

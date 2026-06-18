@@ -578,6 +578,8 @@ export default {
       sellFailed: '卖出失败:',
       flattened: '已平仓 {ticker}',
       flattenFailed: '平仓失败:',
+      toHoldingDone: '已将 {ticker} 加入持仓追踪',
+      toHoldingExists: '{ticker} 已在持仓追踪中',
       placed: '已成交',
       placeFailed: '下单失败：',
       snapshotted: '已记录净值快照',
@@ -624,6 +626,7 @@ export default {
       sell: '卖出',
       flatten: '一键平仓',
       kline: 'K 线',
+      toHolding: '加入持仓追踪',
     },
     orderCols: {
       time: '时间',

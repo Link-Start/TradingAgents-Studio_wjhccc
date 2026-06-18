@@ -32,6 +32,7 @@ from .. import database as db
 from ..executors import quote_executor
 from ..models import (
     PaperOrderRequest, PaperOrderFromDecision, PaperAccountReset, PaperCapitalAdjust,
+    PaperToHolding,
 )
 
 logger = logging.getLogger(__name__)
@@ -568,6 +569,39 @@ async def adjust_capital(req: PaperCapitalAdjust):
     if err:
         raise HTTPException(status_code=400, detail=err)
     return updated
+
+
+@router.post("/positions/to-holding")
+async def position_to_holding(req: PaperToHolding):
+    """Copy a paper position into the real-money holdings tracker.
+
+    Idempotent: if a holding for the ticker already exists, returns it without
+    creating a duplicate. The new holding mirrors the paper position's shares
+    and average cost so the user's real-money tracking starts from there.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _work():
+        acct = db.ensure_default_paper_account()
+        pos = next((p for p in db.list_paper_positions(acct["id"])
+                    if p["ticker"].upper() == req.ticker.upper() and (p.get("shares") or 0) > 0),
+                   None)
+        if not pos:
+            return None, "no_position"
+        for h in db.list_holdings():
+            if h["ticker"].upper() == req.ticker.upper():
+                return h, "exists"
+        h = db.create_holding(
+            ticker=pos["ticker"], asset_type=pos.get("asset_type", "stock"),
+            shares=pos["shares"], cost_price=pos["avg_cost"],
+            open_date=datetime.now().strftime("%Y-%m-%d"), notes="来自模拟交易",
+        )
+        return h, "created"
+
+    holding, status = await loop.run_in_executor(None, _work)
+    if status == "no_position":
+        raise HTTPException(status_code=404, detail="未找到该模拟持仓")
+    return {"holding": holding, "status": status}
 
 
 @router.get("/positions")

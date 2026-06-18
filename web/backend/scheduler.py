@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -34,6 +35,12 @@ _LOOP_INTERVAL_SEC = 30
 
 # Consecutive failure count that flips a schedule to 'disabled'.
 _AUTO_DISABLE_AFTER = 3
+
+# Cross-schedule de-dup window: skip a scheduled analysis if the SAME ticker was
+# already analysed this recently (by any other schedule). Short by design so a
+# single schedule's own cadence (hourly+) is never blocked — it only collapses
+# genuinely duplicate schedule rows for one ticker. 0 disables the gate.
+_DEDUP_ANALYSIS_MINUTES = int(os.getenv("TRADINGAGENTS_DEDUP_ANALYSIS_MINUTES", "30"))
 
 # Don't catch up runs that were missed more than this long ago (e.g. after
 # a multi-day server outage we shouldn't flood the LLM with backfill).
@@ -488,6 +495,21 @@ class SchedulerService:
                     sid, schedule["ticker"], next_run,
                 )
                 return
+            # Cross-schedule de-dup: if another schedule already produced a fresh
+            # analysis for this ticker moments ago, skip this duplicate run so we
+            # don't double-burn LLM tokens. (Holdings tracking never triggers
+            # analysis; this only guards genuinely duplicate schedule rows.)
+            if _DEDUP_ANALYSIS_MINUTES > 0:
+                dup = await loop.run_in_executor(
+                    None,
+                    lambda: db.recent_analysis_exists(schedule["ticker"], _DEDUP_ANALYSIS_MINUTES),
+                )
+                if dup:
+                    logger.info(
+                        "Schedule %s (%s): skipped — analysed <%dm ago, resumes %s",
+                        sid, schedule["ticker"], _DEDUP_ANALYSIS_MINUTES, next_run,
+                    )
+                    return
             analysis_id = str(uuid.uuid4())
             # Throttle: only _MAX_CONCURRENT_RUNS analyses run at once; the rest
             # wait here. Timeout guards against a single run hanging forever.

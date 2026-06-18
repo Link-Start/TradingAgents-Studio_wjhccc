@@ -234,6 +234,11 @@ class PaperCapitalAdjust(BaseModel):
     delta: float
 
 
+class PaperToHolding(BaseModel):
+    # Copy a paper position into the (real-money) holdings tracker by ticker.
+    ticker: str
+
+
 class ScreenRequest(BaseModel):
     """Start a stock-screening ("选股") run.
 

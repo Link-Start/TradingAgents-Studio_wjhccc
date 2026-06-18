@@ -380,6 +380,19 @@ function confirmFlatten(p: PaperPosition) {
     },
   })
 }
+async function addToHolding(p: PaperPosition) {
+  try {
+    const { data } = await api.post('/api/paper/positions/to-holding', { ticker: p.ticker })
+    if (data.status === 'exists') {
+      message.info(t('paper.msg.toHoldingExists', { ticker: p.ticker }))
+    } else {
+      message.success(t('paper.msg.toHoldingDone', { ticker: p.ticker }))
+    }
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  }
+}
+
 const orderForm = reactive({
   ticker: '',
   action: 'buy' as 'buy' | 'sell',
@@ -472,7 +485,7 @@ const positionColumns = computed(() => [
   {
     title: t('paper.posCols.actions'),
     key: 'actions',
-    width: 220,
+    width: 300,
     render(r: PaperPosition) {
       return h(NSpace, { size: 4 }, () => [
         h(NButton, {
@@ -488,6 +501,12 @@ const positionColumns = computed(() => [
           size: 'tiny',
           onClick: () => openKLine(r.ticker, r.avg_cost),
         }, () => t('paper.posBtn.kline')),
+        h(NButton, {
+          size: 'tiny',
+          type: 'primary',
+          ghost: true,
+          onClick: () => addToHolding(r),
+        }, () => t('paper.posBtn.toHolding')),
       ])
     },
   },
