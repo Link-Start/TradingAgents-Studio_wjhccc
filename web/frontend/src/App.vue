@@ -3,7 +3,8 @@
     <n-notification-provider>
       <n-message-provider>
         <n-dialog-provider>
-          <n-layout has-sider style="height: 100vh">
+          <router-view v-if="route.name === 'login'" />
+          <n-layout v-else has-sider style="height: 100vh">
             <n-layout-sider bordered :width="220" :collapsed-width="64" show-trigger collapse-mode="width" :collapsed="collapsed" @update:collapsed="(v: boolean) => collapsed = v">
               <div class="brand">
                 <img v-if="!collapsed" src="/logo.svg" alt="TradingAgents-Studio" class="brand-logo-full" />
@@ -35,6 +36,16 @@
                     </n-button>
                   </template>
                   {{ isRedTheme ? t('app.themeRed') : t('app.themeGreen') }}
+                </n-tooltip>
+                <n-tooltip v-if="auth.authRequired" trigger="hover">
+                  <template #trigger>
+                    <n-button quaternary circle @click="onLogout">
+                      <template #icon>
+                        <n-icon><LogOutOutline /></n-icon>
+                      </template>
+                    </n-button>
+                  </template>
+                  {{ t('menu.logout') }}
                 </n-tooltip>
               </div>
             </n-layout-sider>
@@ -71,12 +82,20 @@ import {
   StatsChartOutline,
   AnalyticsOutline,
   LanguageOutline,
+  LogOutOutline,
 } from '@vicons/ionicons5'
 import { naiveLocale, naiveDateLocale, setLocale } from './i18n'
+import { useAuthStore } from './stores/auth'
 
 const { t, locale } = useI18n()
 const router = useRouter()
 const route = useRoute()
+const auth = useAuthStore()
+
+async function onLogout() {
+  await auth.logout()
+  router.replace({ name: 'login' })
+}
 
 const collapsed = ref(false)
 const isRedTheme = ref(localStorage.getItem('themeColor') !== 'green')

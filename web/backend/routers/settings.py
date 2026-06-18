@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
-from tradingagents.default_config import DEFAULT_CONFIG, _ENV_OVERRIDES
+from tradingagents.default_config import DEFAULT_CONFIG, _ENV_OVERRIDES, _apply_env_overrides
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from .. import database as db
@@ -13,12 +13,13 @@ from ..models import SettingsUpdate, APIKeysUpdate
 router = APIRouter(prefix="/api", tags=["settings"])
 
 # Runtime settings override (in-memory, persists for server lifetime).
-# .env-persisted fields are reapplied on startup via DEFAULT_CONFIG so this
-# dict only needs to hold the per-request deltas the server saw.
+# Repopulated on startup from the DB via reload_overrides_from_env(), so this
+# dict mirrors the persisted TRADINGAGENTS_* settings plus any per-request delta.
 _overrides: dict = {}
 
-# Project-root .env file shared with the CLI. Resolved relative to this file
-# so the path is correct regardless of where the server is launched from.
+# Project-root .env file. Still written best-effort so a *local* CLI run shares
+# the same keys; in a container this file is ephemeral, which is exactly why the
+# durable copy now lives in the DB (app_settings table).
 _ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
 
 # Reverse map: config-key → TRADINGAGENTS_* env var name. Built once from
@@ -31,6 +32,48 @@ def get_effective_config() -> dict:
     config = DEFAULT_CONFIG.copy()
     config.update(_overrides)
     return config
+
+
+def reload_overrides_from_env() -> None:
+    """Rebuild ``_overrides`` from the current ``os.environ``.
+
+    Called at startup AFTER ``database.load_app_settings_into_environ()`` has
+    pushed the persisted DB settings into the environment, so the Settings page
+    and every analysis run (which read ``get_effective_config()``) reflect the
+    saved values. DEFAULT_CONFIG itself is a frozen import-time snapshot; this is
+    how DB-persisted TRADINGAGENTS_* settings get re-applied on each boot.
+    """
+    base = DEFAULT_CONFIG.copy()
+    _apply_env_overrides(base)  # reads os.environ (now seeded from the DB)
+    for _env_var, key in _ENV_OVERRIDES.items():
+        if key:
+            _overrides[key] = base.get(key)
+
+
+def _persist_env(env_var: str, value: Optional[str]) -> None:
+    """Persist one env var to the DB (durable source of truth), mirror it into
+    ``os.environ`` for the running process, and best-effort write-through to .env
+    (for a co-located CLI; ignored if it fails, e.g. read-only/ephemeral fs).
+
+    A falsy ``value`` clears the setting everywhere.
+    """
+    if value:
+        db.set_app_setting(env_var, value)
+        os.environ[env_var] = value
+    else:
+        db.delete_app_setting(env_var)
+        os.environ.pop(env_var, None)
+    try:
+        from dotenv import set_key, unset_key  # type: ignore
+        _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not _ENV_PATH.exists():
+            _ENV_PATH.write_text("", encoding="utf-8")
+        if value:
+            set_key(str(_ENV_PATH), env_var, value, quote_mode="never")
+        else:
+            unset_key(str(_ENV_PATH), env_var)
+    except Exception:  # noqa: BLE001 — .env write-through is best-effort only
+        pass
 
 
 @router.get("/settings")
@@ -56,52 +99,32 @@ async def get_settings():
 
 @router.put("/settings")
 async def update_settings(req: SettingsUpdate):
-    """Update settings and persist any TRADINGAGENTS_*-mapped fields to .env.
+    """Update settings and persist any TRADINGAGENTS_*-mapped fields to the DB.
 
-    Fields that have a corresponding ``TRADINGAGENTS_*`` env var (per
-    ``_ENV_OVERRIDES``) are written through to the project-root ``.env``
-    AND mirrored into ``os.environ`` so:
-      * the running server picks them up immediately (via the in-memory
-        ``_overrides`` dict), and
-      * the next server start re-reads them through ``DEFAULT_CONFIG``'s
-        ``_apply_env_overrides``, so the choice survives restarts and is
-        shared with the CLI.
-    Fields without an env-var mapping (e.g. ``benchmark_ticker``) still
-    get applied in-memory.
+    Fields with a corresponding ``TRADINGAGENTS_*`` env var (per
+    ``_ENV_OVERRIDES``) are persisted to the ``app_settings`` table (durable,
+    survives container rebuilds) and mirrored into ``os.environ`` so:
+      * the running server picks them up immediately (via ``_overrides``), and
+      * the next server start re-applies them through
+        ``database.load_app_settings_into_environ`` + ``reload_overrides_from_env``.
+    Fields without an env-var mapping (e.g. ``data_cache_dir``) still get
+    applied in-memory.
     """
     updates = req.model_dump(exclude_none=True)
     if not updates:
         return {"ok": True, "updated": []}
 
-    # In-memory apply first, so /api/settings reflects the new state
-    # without waiting on the disk write.
+    # In-memory apply first, so /api/settings reflects the new state immediately.
     _overrides.update(updates)
 
     persisted: list[str] = []
-    try:
-        from dotenv import set_key  # type: ignore
-    except ImportError:
-        # Without python-dotenv we can still apply in-memory; the CLI just
-        # won't see the change on next start.
-        return {"ok": True, "updated": list(updates.keys()), "persisted": [], "warning": "python-dotenv not installed; changes not written to .env"}
-
-    _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not _ENV_PATH.exists():
-        _ENV_PATH.write_text("", encoding="utf-8")
-
     for key, value in updates.items():
         env_var = _CONFIG_KEY_TO_ENV.get(key)
-        if not env_var:
+        if not env_var or value is None:
             continue
-        # Coerce booleans / ints / None into the string form dotenv writes.
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            str_val = "true" if value else "false"
-        else:
-            str_val = str(value)
-        set_key(str(_ENV_PATH), env_var, str_val, quote_mode="never")
-        os.environ[env_var] = str_val
+        # Coerce booleans / ints into the string form env vars use.
+        str_val = ("true" if value else "false") if isinstance(value, bool) else str(value)
+        _persist_env(env_var, str_val)
         persisted.append(env_var)
 
     return {"ok": True, "updated": list(updates.keys()), "persisted": persisted}
@@ -179,24 +202,11 @@ async def update_api_keys(req: APIKeysUpdate):
 
     Each entry in ``keys`` maps a provider name (case-insensitive) to either
     a new key (any non-empty string) or an empty string to clear it. Changes
-    are mirrored into ``os.environ`` for the running process AND persisted
-    into the project-root ``.env`` file so a restart preserves them.
+    are persisted to the durable ``app_settings`` table (so they survive a
+    container rebuild) and mirrored into ``os.environ`` for the running process.
     """
     if not req.keys:
         return {"ok": True, "updated": []}
-
-    try:
-        from dotenv import set_key, unset_key  # type: ignore
-    except ImportError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"python-dotenv is required to persist keys: {e}",
-        )
-
-    # Make sure the .env file exists; set_key requires it to.
-    _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not _ENV_PATH.exists():
-        _ENV_PATH.write_text("", encoding="utf-8")
 
     updated: list[str] = []
     unknown: list[str] = []
@@ -207,13 +217,7 @@ async def update_api_keys(req: APIKeysUpdate):
         if not env_var:
             unknown.append(provider_raw)
             continue
-        value = value or ""
-        if value:
-            set_key(str(_ENV_PATH), env_var, value, quote_mode="never")
-            os.environ[env_var] = value
-        else:
-            unset_key(str(_ENV_PATH), env_var)
-            os.environ.pop(env_var, None)
+        _persist_env(env_var, value or "")
         updated.append(env_var)
 
     if unknown and not updated:

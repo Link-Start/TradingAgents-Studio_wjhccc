@@ -53,6 +53,14 @@ export default {
     starting: '服务启动中…',
   },
 
+  login: {
+    subtitle: '请登录以继续',
+    username: '用户名',
+    password: '密码',
+    submit: '登录',
+    error: '登录失败,请重试',
+  },
+
   menu: {
     dashboard: '仪表盘',
     analyze: '新建分析',
@@ -64,6 +72,7 @@ export default {
     quality: '决策质量',
     history: '历史记录',
     settings: '设置',
+    logout: '退出登录',
   },
 
   screener: {

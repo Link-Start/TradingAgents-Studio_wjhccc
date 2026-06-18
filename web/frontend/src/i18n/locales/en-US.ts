@@ -53,6 +53,14 @@ export default {
     starting: 'Starting up…',
   },
 
+  login: {
+    subtitle: 'Sign in to continue',
+    username: 'Username',
+    password: 'Password',
+    submit: 'Sign in',
+    error: 'Sign-in failed, please try again',
+  },
+
   menu: {
     dashboard: 'Dashboard',
     analyze: 'New analysis',
@@ -64,6 +72,7 @@ export default {
     quality: 'Decision quality',
     history: 'History',
     settings: 'Settings',
+    logout: 'Sign out',
   },
 
   screener: {

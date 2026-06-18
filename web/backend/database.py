@@ -302,6 +302,21 @@ Table(
     Index("idx_screen_runs_created", "created_at"),
 )
 
+# Persisted app configuration managed from the Settings page — LLM/data API keys
+# and the TRADINGAGENTS_* runtime settings. Stored by their ENVIRONMENT-VARIABLE
+# name (e.g. ``OPENAI_API_KEY``, ``TRADINGAGENTS_MAX_DEBATE_ROUNDS``) so startup
+# can copy them straight back into ``os.environ``. This replaces writing to the
+# project-root .env, which is ephemeral inside a rebuilt container — the DB
+# (MySQL in production) is durable, so UI-set keys/settings survive redeploys.
+# Column names are ``skey``/``svalue`` because ``key``/``value`` are reserved
+# words on MySQL. Values are stored in plaintext (same trust level as .env).
+Table(
+    "app_settings", _METADATA,
+    Column("skey", String(128), primary_key=True),
+    Column("svalue", _BigText),
+    Column("updated_at", String(40), nullable=False),
+)
+
 
 # ---------------------------------------------------------------------------
 # Engine — one SQLAlchemy Engine per process, rebuilt only when the resolved URL
@@ -1691,6 +1706,56 @@ def delete_backtest_run(run_id: int):
         conn.execute("DELETE FROM backtest_trades WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM backtest_nav WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM backtest_runs WHERE id = ?", (run_id,))
+
+
+# --- App settings (Settings-page config: API keys + TRADINGAGENTS_* settings) ---
+
+def get_app_settings() -> dict:
+    """All persisted settings as ``{env_var_name: value}``."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT skey, svalue FROM app_settings").fetchall()
+    return {r["skey"]: r["svalue"] for r in rows}
+
+
+def set_app_setting(skey: str, svalue: str):
+    """Upsert one setting keyed by its environment-variable name."""
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_db() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM app_settings WHERE skey = ?", (skey,)
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE app_settings SET svalue = ?, updated_at = ? WHERE skey = ?",
+                (svalue, now, skey),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO app_settings (skey, svalue, updated_at) VALUES (?, ?, ?)",
+                (skey, svalue, now),
+            )
+
+
+def delete_app_setting(skey: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM app_settings WHERE skey = ?", (skey,))
+
+
+def load_app_settings_into_environ() -> int:
+    """Copy persisted settings into ``os.environ`` at startup.
+
+    The DB is the source of truth for UI-managed config, so these OVERWRITE any
+    seed values from .env / panel env vars (which only matter on a first boot
+    before anything has been saved). Must run before the LLM clients / scheduler
+    read their keys, and before ``settings.reload_overrides_from_env``. Returns
+    the number of settings loaded.
+    """
+    settings = get_app_settings()
+    for k, v in settings.items():
+        if v is None:
+            continue
+        os.environ[k] = v
+    return len(settings)
 
 
 def checkpoint_sqlite():
