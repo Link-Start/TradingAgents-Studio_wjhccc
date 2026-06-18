@@ -234,6 +234,32 @@ def _parse_config(config_json: str) -> dict:
     return {}
 
 
+def _norm_confidence(c) -> Optional[float]:
+    """Normalise a stored confidence to the 0-1 scale the UI/calibration expect.
+
+    ``graph_runner._extract_confidence`` just scrapes the first number out of the
+    PM's text, so historical rows carry mixed scales: 0.7 ("0.7"), 7 ("7/10"),
+    or 85 ("85%"). The calibration curve buckets on 0-1, so without this most
+    decisions would fall outside every bucket and the curve would read empty.
+    Heuristic: <=1 already a fraction; <=10 a /10 rating; else a percentage.
+    """
+    if c is None:
+        return None
+    try:
+        c = float(c)
+    except (TypeError, ValueError):
+        return None
+    if c < 0:
+        return None
+    if c <= 1:
+        return c
+    if c <= 10:
+        return c / 10.0
+    if c <= 100:
+        return c / 100.0
+    return 1.0
+
+
 def _build_eval_rows(
     rows: list[dict],
     horizon: int,
@@ -280,7 +306,7 @@ def _build_eval_rows(
                 ticker=r["ticker"],
                 trade_date=r["trade_date"],
                 signal=r.get("signal"),
-                confidence=r.get("confidence"),
+                confidence=_norm_confidence(r.get("confidence")),
                 created_at=r.get("created_at", ""),
                 analysts=_parse_analyst_combo(r.get("analysts", "[]")),
             )
@@ -298,26 +324,20 @@ def _build_eval_rows(
             if target > today:
                 out.append(er)
                 continue
-            if price_series is None or bench is None:
+            # Raw return / win only need the stock's own price. We compute them
+            # whenever the stock series is available — a missing BENCHMARK (e.g.
+            # an index symbol that the stock-data vendor can't serve) must NOT
+            # sink the decision; it only costs us the alpha for that row.
+            if price_series is None:
                 out.append(er)
                 continue
-
             entry = _price_at_or_after(price_series, td)
             exit_ = _price_at_or_after(price_series, target)
-            b_entry = _price_at_or_after(bench, td)
-            b_exit = _price_at_or_after(bench, target)
-            if not (entry and exit_ and b_entry and b_exit):
-                out.append(er)
-                continue
-            if entry[1] <= 0 or b_entry[1] <= 0:
+            if not (entry and exit_) or entry[1] <= 0:
                 out.append(er)
                 continue
             raw = (exit_[1] - entry[1]) / entry[1]
-            bench_ret = (b_exit[1] - b_entry[1]) / b_entry[1]
-            alpha = raw - bench_ret
             er.raw_return = raw
-            er.bench_return = bench_ret
-            er.alpha = alpha
             er.horizon_used = horizon
             er.evaluable = True
             sig = (er.signal or "").upper()
@@ -325,6 +345,15 @@ def _build_eval_rows(
                 er.win = raw > 0
             elif sig in _SHORT_SIGNALS:
                 er.win = raw < 0
+
+            # Alpha is best-effort: only when the benchmark series resolves.
+            if bench is not None:
+                b_entry = _price_at_or_after(bench, td)
+                b_exit = _price_at_or_after(bench, target)
+                if b_entry and b_exit and b_entry[1] > 0:
+                    bench_ret = (b_exit[1] - b_entry[1]) / b_entry[1]
+                    er.bench_return = bench_ret
+                    er.alpha = raw - bench_ret
             out.append(er)
     return out
 
@@ -384,9 +413,8 @@ def _alpha_sharpe(alphas: list[float]) -> Optional[float]:
     return mean / sd
 
 
-def _all_eval_rows(horizon: int) -> list[EvalRow]:
-    """Fetch every completed analysis and enrich. Used by overview and
-    dimension breakdowns. Synchronous (called inside run_in_executor)."""
+def _compute_eval_rows(horizon: int) -> list[EvalRow]:
+    """Fetch every completed analysis and enrich. Synchronous."""
     with db.get_db() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, ticker, trade_date, signal, confidence, analysts, "
@@ -395,6 +423,68 @@ def _all_eval_rows(horizon: int) -> list[EvalRow]:
             "ORDER BY trade_date ASC"
         ).fetchall()]
     return _build_eval_rows(rows, horizon=horizon)
+
+
+# Short-lived cache of the enriched rows, keyed by horizon. The Quality page
+# fires 5 endpoints in parallel (overview/calibration/heatmap/decisions/
+# by-dimension), each of which used to rebuild the full row set independently —
+# and on a cold price cache that meant 5 threads racing to fetch the same
+# tickers. A per-horizon lock collapses the burst into ONE computation; the TTL
+# keeps it short so a manual refresh still reflects newly-completed analyses.
+_EVAL_CACHE: dict[int, tuple[float, list[EvalRow]]] = {}
+_EVAL_CACHE_TTL_SEC = 30.0
+_EVAL_LOCKS: dict[int, threading.Lock] = {}
+_EVAL_LOCKS_GUARD = threading.Lock()
+
+
+def _eval_lock_for(horizon: int) -> threading.Lock:
+    with _EVAL_LOCKS_GUARD:
+        lk = _EVAL_LOCKS.get(horizon)
+        if lk is None:
+            lk = threading.Lock()
+            _EVAL_LOCKS[horizon] = lk
+        return lk
+
+
+def _all_eval_rows(horizon: int) -> list[EvalRow]:
+    """Cached, concurrency-safe accessor for the enriched rows at ``horizon``."""
+    now = time.monotonic()
+    hit = _EVAL_CACHE.get(horizon)
+    if hit and now < hit[0]:
+        return hit[1]
+    with _eval_lock_for(horizon):
+        # Re-check: another thread may have filled the cache while we waited.
+        hit = _EVAL_CACHE.get(horizon)
+        if hit and time.monotonic() < hit[0]:
+            return hit[1]
+        rows = _compute_eval_rows(horizon)
+        _EVAL_CACHE[horizon] = (time.monotonic() + _EVAL_CACHE_TTL_SEC, rows)
+        return rows
+
+
+def ticker_alpha_summary(tickers: list[str], horizon: int = 30) -> dict[str, dict]:
+    """Realized-alpha summary per ticker, for the rotation pool's perf eviction.
+
+    Returns ``{TICKER_UPPER: {"avg_alpha": float|None, "n": int}}`` where ``n``
+    is the count of evaluable, alpha-bearing decisions. Reuses the cached
+    ``_all_eval_rows`` so calling this from the screen-schedule reconcile adds
+    no extra vendor load. Tickers with no evaluable history are omitted.
+    """
+    want = {t.upper() for t in tickers}
+    if not want:
+        return {}
+    rows = _all_eval_rows(horizon if horizon in _VALID_HORIZONS else 30)
+    acc: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        if r.alpha is None:
+            continue
+        tk = (r.ticker or "").upper()
+        if tk in want:
+            acc[tk].append(r.alpha)
+    return {
+        tk: {"avg_alpha": sum(v) / len(v), "n": len(v)}
+        for tk, v in acc.items() if v
+    }
 
 
 def _dimension_key(r: EvalRow, dim: str) -> Optional[str]:

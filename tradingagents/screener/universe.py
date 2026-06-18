@@ -147,6 +147,11 @@ def _normalize_em(raw: pd.DataFrame) -> pd.DataFrame:
     tc = _pick(raw, "换手率")
     out["turnover"] = _num(raw[tc]) if tc else float("nan")
     out["amount"] = _num(raw[_pick(raw, "成交额")])
+    # 量比 (volume ratio): today's volume vs its recent average. The single
+    # cheapest "放量" signal — it's in eastmoney's spot payload, so the volume
+    # factor needs no extra fetch. Absent on the 新浪 degraded source → NaN.
+    vr = _pick(raw, "量比")
+    out["volume_ratio"] = _num(raw[vr]) if vr else float("nan")
     pe = _pick(raw, "市盈率")
     out["pe"] = _num(raw[pe]) if pe else float("nan")
     pb = _pick(raw, "市净率")
@@ -217,7 +222,7 @@ def _snap_sina() -> pd.DataFrame:
     out["change_pct"] = _num(raw[_pick(raw, "涨跌幅", "changepercent")])
     out["amount"] = _num(raw[_pick(raw, "成交额", "amount")])
     for col in ("turnover", "pe", "pb", "market_cap", "circ_market_cap",
-                "change_60d", "change_ytd"):
+                "change_60d", "change_ytd", "volume_ratio"):
         out[col] = float("nan")
     return out
 
@@ -337,33 +342,47 @@ def get_industry_constituents(name: str, ttl: float = _DEFAULT_TTL) -> list[str]
     return _cached(f"industry_cons:{name}", ttl, _produce)  # type: ignore[return-value]
 
 
-def rank_capital_flow(ttl: float = _DEFAULT_TTL) -> pd.DataFrame:
-    """Per-stock main-capital net inflow, today. Indexed for joins.
+# Capital-flow lookback period → eastmoney fund-flow-rank ``indicator`` arg.
+# Multi-day net inflow is far less noisy than a single session — one day of
+# 对倒 can fake "今日" inflow, but sustained 3/5/10-day accumulation can't.
+_FLOW_PERIOD_INDICATOR = {"today": "今日", "3d": "3日", "5d": "5日", "10d": "10日"}
 
-    Columns: ``code, main_net_inflow`` (净额, 元) and ``main_net_pct``
-    (净占比, %). Empty DataFrame on failure so callers can left-join safely.
+
+def rank_capital_flow(ttl: float = _DEFAULT_TTL, period: str = "today") -> pd.DataFrame:
+    """Per-stock main-capital net inflow over ``period``. Indexed for joins.
+
+    ``period`` ∈ {today, 3d, 5d, 10d}. Multi-day periods use eastmoney's
+    cumulative fund-flow rank, which captures *sustained* accumulation rather
+    than a single (easily-faked) session. Columns: ``code, main_net_inflow``
+    (净额, 元) and ``main_net_pct`` (净占比, %). Empty DataFrame on failure so
+    callers can left-join safely.
     """
+    indicator = _FLOW_PERIOD_INDICATOR.get(period, "今日")
+
     def _produce() -> pd.DataFrame:
         try:
             raw = _fetch_with_retry(
-                lambda: _ak().stock_individual_fund_flow_rank(indicator="今日"),
-                label="个股资金流", attempts=2, base_sleep=0.5,
+                lambda: _ak().stock_individual_fund_flow_rank(indicator=indicator),
+                label=f"个股资金流({indicator})", attempts=2, base_sleep=0.5,
             )
         except Exception as e:  # noqa: BLE001
             # eastmoney is the only free per-stock capital-flow source, so on
             # failure we degrade to an empty frame (callers left-join, so the
             # capital_flow factor just goes neutral) rather than blocking the
             # whole screen on a dimension that has no fallback vendor.
-            logger.warning("capital flow rank fetch failed (factor degrades to neutral): %s", e)
+            logger.warning("capital flow rank (%s) fetch failed (factor degrades to neutral): %s",
+                           indicator, e)
             return pd.DataFrame(columns=["code", "main_net_inflow", "main_net_pct"])
         out = pd.DataFrame()
         out["code"] = raw[_pick(raw, "代码")].astype(str).str.zfill(6)
+        # Multi-day columns are prefixed ("5日主力净流入-净额") but the keyword
+        # match still finds them.
         out["main_net_inflow"] = _num(raw[_pick(raw, "主力净流入-净额", "主力净流入")])
         pct = _pick(raw, "主力净流入-净占比", "净占比")
         out["main_net_pct"] = _num(raw[pct]) if pct else None
         return out
 
-    return _cached("capital_flow", ttl, _produce)  # type: ignore[return-value]
+    return _cached(f"capital_flow:{period}", ttl, _produce)  # type: ignore[return-value]
 
 
 # --- N-day return (5d/20d) — computed per stock from history ---------------
@@ -439,4 +458,73 @@ def compute_period_returns(codes: list[str], days: int,
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         for code, ret in zip(unique, ex.map(lambda c: _period_return_one(c, days), unique)):
             out[code] = ret
+    return out
+
+
+# --- breakout: how close the last close is to its N-day high ---------------
+
+_NEARHIGH_CACHE: dict[str, tuple[float, Optional[float]]] = {}
+_NEARHIGH_CACHE_LOCK = threading.Lock()
+
+
+def _near_high_one(code: str, lookback: int) -> Optional[float]:
+    """``last_close / max(close over lookback) - 1`` in %, ≤ 0 (0 = at new high).
+
+    A value near 0 means the stock is breaking out to / sitting at its N-day
+    high — the classic "突破" setup. None when history is unavailable. Cached
+    per (code, lookback) on the same TTL as period returns.
+    """
+    key = f"{code}:{lookback}"
+    now = time.monotonic()
+    with _NEARHIGH_CACHE_LOCK:
+        hit = _NEARHIGH_CACHE.get(key)
+        if hit and now < hit[0]:
+            return hit[1]
+
+    val: Optional[float] = None
+    try:
+        import io
+        from datetime import datetime, timedelta
+        import pandas as _pd
+        from tradingagents.dataflows.interface import route_to_vendor
+        end = datetime.now()
+        start = end - timedelta(days=lookback * 2 + 12)
+        csv_str = route_to_vendor("get_stock_data", code,
+                                  start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if isinstance(csv_str, str):
+            hdr = csv_str.find("\n\n")
+            data = csv_str[hdr + 2:] if hdr != -1 else csv_str
+            df = _pd.read_csv(io.StringIO(data))
+            if not df.empty and "Close" in df.columns:
+                closes = df["Close"].dropna().tolist()
+                window = closes[-lookback:] if len(closes) >= lookback else closes
+                if window:
+                    hi = max(window)
+                    if hi:
+                        val = round((closes[-1] / hi - 1) * 100, 2)
+    except Exception as e:  # noqa: BLE001 — missing history is non-fatal
+        logger.debug("near-high fetch failed for %s: %s", code, e)
+
+    with _NEARHIGH_CACHE_LOCK:
+        _NEARHIGH_CACHE[key] = (now + _RET_CACHE_TTL, val)
+    return val
+
+
+def compute_near_high(codes: list[str], lookback: int = 20,
+                      max_workers: int = 8) -> dict[str, Optional[float]]:
+    """Map code → distance-to-N-day-high (%), concurrently (capped, cached).
+
+    Same bounding/caching contract as ``compute_period_returns``. Caller must
+    pre-narrow ``codes``; hard-capped at ``PERIOD_RETURN_CAP``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    unique = list(dict.fromkeys(codes))
+    if len(unique) > PERIOD_RETURN_CAP:
+        logger.info("near-high: capping %d → %d codes", len(unique), PERIOD_RETURN_CAP)
+        unique = unique[:PERIOD_RETURN_CAP]
+    out: dict[str, Optional[float]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for code, v in zip(unique, ex.map(lambda c: _near_high_one(c, lookback), unique)):
+            out[code] = v
     return out

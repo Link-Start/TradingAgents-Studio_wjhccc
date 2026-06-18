@@ -39,6 +39,10 @@ _MOMENTUM_KW = ("强势", "上涨", "突破", "动量", "趋势", "走强", "领
 # Oversold / mean-reversion intent — rank the WORST performers first.
 _REVERSAL_KW = ("超跌", "抄底", "反弹", "反转", "跌得多", "跌幅", "跌得狠", "低位", "回调到位", "深跌")
 _FLOW_KW = ("主力", "资金流入", "净流入", "资金流", "增仓", "吸筹", "流入")
+# Sustained-inflow intent → multi-day cumulative flow (less fakeable than 1 day).
+_FLOW_SUSTAINED_KW = ("持续", "连续", "几天", "多日", "近期一直", "长期", "稳定流入")
+# 放量突破 intent → turn on the volume factor + breakout (distance-to-N-day-high).
+_BREAKOUT_KW = ("放量", "量比", "突破", "启动", "异动", "新高", "爆量", "巨量", "拉升")
 
 # Momentum look-back period keywords → StrategySpec.momentum_period.
 _PERIOD_KW: dict[str, str] = {
@@ -103,7 +107,7 @@ def _compile_with_rules(text: str) -> tuple[StrategySpec, list[str], int]:
     low = text.lower()
     spec = StrategySpec(weights=dict(DEFAULT_WEIGHTS))
     labels: list[str] = []
-    weights = {"value": 0.0, "momentum": 0.0, "capital_flow": 0.0}
+    weights = {"value": 0.0, "momentum": 0.0, "capital_flow": 0.0, "volume": 0.0}
     hits = 0
 
     def has(words) -> bool:
@@ -145,7 +149,21 @@ def _compile_with_rules(text: str) -> tuple[StrategySpec, list[str], int]:
         hits += 1
     if has(_FLOW_KW):
         weights["capital_flow"] += 1.5
-        labels.append("主力资金流入")
+        # Sustained inflow → cumulative multi-day flow (default stays 'today').
+        if has(_FLOW_SUSTAINED_KW):
+            spec.capital_flow_period = "5d"
+            labels.append("主力持续净流入(近5日)")
+        else:
+            labels.append("主力资金流入")
+        hits += 1
+    if has(_BREAKOUT_KW):
+        spec.breakout = True
+        weights["volume"] += 1.5
+        # A breakout screen implies trend-following momentum if none chosen yet.
+        if weights["momentum"] == 0:
+            spec.momentum_direction = "up"
+            weights["momentum"] += 1.0
+        labels.append("放量突破")
         hits += 1
     if has(_MAINBOARD_KW):
         spec.main_board_only = True

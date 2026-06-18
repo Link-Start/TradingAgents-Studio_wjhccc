@@ -27,6 +27,24 @@ from .scheduler import compute_first_run_at
 
 logger = logging.getLogger(__name__)
 
+# --- Performance-aware eviction (D) -----------------------------------------
+# A pool name with at least this many evaluable decisions whose realized alpha
+# (vs its regional benchmark, over PERF_HORIZON days) averages below the floor
+# is a chronic under-performer: evicted even if it's still being re-selected,
+# so the rotating pool keeps cycling capital toward names that actually work.
+# Held names are always protected. Tunable via env without a redeploy.
+import os as _os
+
+PERF_HORIZON = int(_os.getenv("TRADINGAGENTS_POOL_PERF_HORIZON", "30"))
+PERF_MIN_DECISIONS = int(_os.getenv("TRADINGAGENTS_POOL_PERF_MIN_DECISIONS", "3"))
+PERF_ALPHA_FLOOR = float(_os.getenv("TRADINGAGENTS_POOL_PERF_ALPHA_FLOOR", "-0.03"))
+
+# --- Funnel narrowing (E) ---------------------------------------------------
+# Deep analysis is expensive (multi-agent × LLM), so only the best-ranked few
+# screen hits get a child analysis schedule each cycle — the rest are shown by
+# the screener but not analysed. 0/unset → no extra cap beyond the screen top_n.
+ANALYZE_TOP_K = int(_os.getenv("TRADINGAGENTS_POOL_ANALYZE_TOP_K", "8"))
+
 
 def _held_tickers() -> set[str]:
     """Union of real-holdings and default paper-account positions (upper-cased).
@@ -75,6 +93,11 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
     hits = [str(c.get("ticker") or c.get("code")).upper()
             for c in candidates if (c.get("ticker") or c.get("code"))]
     hit_set = set(hits)
+    # E — only the best-ranked few get a (expensive) child analysis each cycle;
+    # the rest are surfaced by the screener but not deep-analysed. ``hits`` is
+    # already best-first from the scorer.
+    analyze_hits = hits[:ANALYZE_TOP_K] if (ANALYZE_TOP_K and ANALYZE_TOP_K > 0) else hits
+    analyze_set = set(analyze_hits)
     score_by_ticker = {
         str(c.get("ticker") or c.get("code")).upper(): (c.get("score") or 0.0)
         for c in candidates if (c.get("ticker") or c.get("code"))
@@ -89,7 +112,20 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
     }
     held = _held_tickers()
 
-    added, kept, missed, evicted, skipped = [], [], [], [], []
+    # D — realized-alpha per managed name (cached, no extra vendor load), used to
+    # evict chronic under-performers regardless of re-selection.
+    try:
+        from .routers.quality import ticker_alpha_summary
+        alpha = ticker_alpha_summary(list(managed.keys()), PERF_HORIZON)
+    except Exception:  # noqa: BLE001 — perf eviction is best-effort
+        logger.exception("reconcile: alpha summary failed")
+        alpha = {}
+
+    def _chronic_loser(tk: str) -> bool:
+        s = alpha.get(tk.upper())
+        return bool(s and s["n"] >= PERF_MIN_DECISIONS and s["avg_alpha"] < PERF_ALPHA_FLOOR)
+
+    added, kept, missed, evicted, skipped, perf_evicted = [], [], [], [], [], []
 
     next_run = compute_first_run_at(
         ss.get("sub_schedule_type") or "daily",
@@ -99,9 +135,14 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
         asset_type,
     )
 
-    # 1. Hits ----------------------------------------------------------------
-    for ticker in hits:
+    # 1. Hits (top-K only) ---------------------------------------------------
+    for ticker in analyze_hits:
         if ticker in managed:
+            # Chronic loser (and not held) → evict despite re-selection.
+            if _chronic_loser(ticker) and ticker not in held:
+                db.delete_schedule(managed[ticker]["id"])
+                perf_evicted.append(ticker)
+                continue
             # Survivor — clear its miss streak.
             if managed[ticker].get("miss_count"):
                 db.update_schedule(managed[ticker]["id"], miss_count=0)
@@ -129,9 +170,9 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
             all_active.add(ticker)
             added.append(ticker)
 
-    # 2. Misses (managed rows no longer selected) ----------------------------
+    # 2. Misses (managed rows not in the analyse set) ------------------------
     for ticker, row in managed.items():
-        if ticker in hit_set:
+        if ticker in analyze_set:
             continue
         if ticker in held:
             # Protected: keep analysing a held name; reset the streak so it
@@ -139,6 +180,11 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
             if row.get("miss_count"):
                 db.update_schedule(row["id"], miss_count=0)
             kept.append(ticker)
+            continue
+        # Chronic loser → evict now, don't wait out the miss grace.
+        if _chronic_loser(ticker):
+            db.delete_schedule(row["id"])
+            perf_evicted.append(ticker)
             continue
         new_miss = int(row.get("miss_count") or 0) + 1
         if new_miss >= evict_after:
@@ -154,18 +200,22 @@ def _reconcile_pool(ss: dict, candidates: list, screen_run_id: str) -> dict:
                 if s["ticker"].upper() not in held]
         overflow = len(pool) - int(max_pool)
         if overflow > 0:
-            # Worst = highest miss streak, then lowest fresh score.
-            pool.sort(key=lambda s: (
-                -int(s.get("miss_count") or 0),
-                score_by_ticker.get(s["ticker"].upper(), 0.0),
-            ))
+            # Worst first: lowest realized alpha (no data → neutral 0), then
+            # highest miss streak, then lowest fresh score.
+            def _worst_key(s):
+                tk = s["ticker"].upper()
+                a = alpha.get(tk)
+                av = a["avg_alpha"] if a else 0.0
+                return (av, -int(s.get("miss_count") or 0), score_by_ticker.get(tk, 0.0))
+            pool.sort(key=_worst_key)
             for s in pool[:overflow]:
                 db.delete_schedule(s["id"])
                 evicted.append(s["ticker"].upper())
 
     return {
         "matched": len(hits), "added": added, "kept": kept,
-        "missed": missed, "evicted": evicted, "skipped": skipped,
+        "missed": missed, "evicted": evicted + perf_evicted,
+        "perf_evicted": perf_evicted, "skipped": skipped,
         "screen_run_id": screen_run_id,
     }
 
@@ -202,10 +252,11 @@ async def reconcile(ss: dict) -> bool:
             None, lambda: _reconcile_pool(ss, candidates, run_id),
         )
         logger.info(
-            "screen schedule %s reconciled: matched=%d +%d kept=%d miss=%d evict=%d skip=%d",
+            "screen schedule %s reconciled: matched=%d +%d kept=%d miss=%d evict=%d (perf=%d) skip=%d",
             ss["id"], summary["matched"], len(summary["added"]),
             len(summary["kept"]), len(summary["missed"]),
-            len(summary["evicted"]), len(summary["skipped"]),
+            len(summary["evicted"]), len(summary.get("perf_evicted", [])),
+            len(summary["skipped"]),
         )
         return True
     except Exception:  # noqa: BLE001

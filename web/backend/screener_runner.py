@@ -119,10 +119,18 @@ class ScreenerRunner:
                 setattr(spec, f, None)
             spec.weights = {"value": 0.0,
                             "momentum": spec.weights.get("momentum", 1.0) or 1.0,
-                            "capital_flow": spec.weights.get("capital_flow", 0.0)}
-            self._enqueue("warning",
-                          f"行情来自{meta.get('source')}，缺少估值/市值数据，"
-                          f"本次按动量/资金流选股（估值类条件已忽略）")
+                            "capital_flow": spec.weights.get("capital_flow", 0.0),
+                            "volume": spec.weights.get("volume", 0.0)}
+            degraded = (f"行情来自{meta.get('source')}（降级源），缺少估值/市值/量比数据，"
+                        f"本次按动量/资金流选股，估值类条件已忽略。")
+            self._enqueue("warning", degraded)
+            # A scheduled screen has no WS listener, so the queue warning is
+            # invisible — log it and persist it into the run's provenance so
+            # the History/screen record shows the data was degraded.
+            logger.warning("screen run %s degraded data source: %s", self.run_id, meta.get("source"))
+            provenance["notes"] = (provenance.get("notes") or "") + " " + degraded
+            strategy_dict = {**spec.to_dict(), "provenance": provenance}
+            db.update_screen_run(self.run_id, strategy=strategy_dict)
         filtered = factors.apply_filters(snapshot, spec)
         matched = len(filtered)
         if getattr(spec, "buyable_only", False) and matched == 0:
@@ -131,12 +139,36 @@ class ScreenerRunner:
                           "暂无可低吸的标的；可改用『近一周/近一月』周期找尚未启动的票，"
                           "或取消该选项查看全部。")
         cap_flow = None
-        # Only fetch capital flow if it actually influences the ranking.
+        # Only fetch capital flow if it actually influences the ranking. The
+        # period (today/3d/5d/10d) is part of the strategy — sustained inflow
+        # is far less fakeable than a single session.
         if spec.weights.get("capital_flow", 0):
-            cap_flow = universe.rank_capital_flow()
+            flow_period = getattr(spec, "capital_flow_period", "today") or "today"
+            cap_flow = universe.rank_capital_flow(period=flow_period)
+            if flow_period != "today":
+                self._enqueue("screening", f"采用近{flow_period}主力净流入(持续吸筹)")
 
         # Resolve which column feeds the momentum factor for the chosen period.
         momentum_col = self._resolve_momentum_column(spec, filtered, universe, meta)
+
+        # 放量突破: compute each candidate's distance to its 20-day high (needs
+        # per-stock history, so only for the filtered+capped set, and only when
+        # the volume/breakout factor actually weighs in).
+        if (getattr(spec, "breakout", False) or spec.weights.get("volume", 0)) \
+                and not filtered.empty and "near_high_pct" not in filtered.columns:
+            codes = filtered["code"].tolist()
+            cap = universe.PERIOD_RETURN_CAP
+            if len(codes) > cap:
+                pre = filtered.reindex(
+                    filtered["change_pct"].abs().sort_values(ascending=False).index
+                )
+                codes = pre["code"].head(cap).tolist()
+                self._enqueue("warning",
+                              f"放量突破需逐只拉历史，候选 {len(filtered)} 只超上限，"
+                              f"仅对最活跃的 {cap} 只计算突破度")
+            self._enqueue("ranking", f"计算接近20日新高的突破度中({len(codes)} 只)…")
+            near = universe.compute_near_high(codes, lookback=20)
+            filtered["near_high_pct"] = filtered["code"].map(near)
 
         # No ranking-level buyability penalty: '强势追涨' must show the raw 涨幅榜
         # (limit-ups at the top), and '只看可买入' already *filters* un-enterable
@@ -219,7 +251,7 @@ class ScreenerRunner:
             "market_cap_max", "change_pct_min", "change_pct_max",
             "turnover_min", "turnover_max", "sector_query", "exclude_st",
             "momentum_period", "momentum_direction", "main_board_only",
-            "buyable_only",
+            "buyable_only", "capital_flow_period", "breakout", "volume_ratio_min",
         }
         for k, v in self.filters.items():
             if k in allowed and v is not None:
@@ -229,6 +261,10 @@ class ScreenerRunner:
         if (self.filters.get("momentum_period") or self.filters.get("momentum_direction")) \
                 and not spec.weights.get("momentum"):
             spec.weights["momentum"] = 1.5
+        # Opting into breakout / 量比 from the UI means the volume factor matters.
+        if (self.filters.get("breakout") or self.filters.get("volume_ratio_min")) \
+                and not spec.weights.get("volume"):
+            spec.weights["volume"] = 1.5
 
     def _build_llm(self):
         from .routers.settings import get_effective_config

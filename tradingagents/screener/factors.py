@@ -23,9 +23,12 @@ _FACTOR_DIRECTION = {
     "value": False,        # low PE/PB preferred
     "momentum": True,      # high recent change preferred
     "capital_flow": True,  # high main net inflow preferred
+    "volume": True,        # high 量比 / nearer N-day high preferred (放量突破)
 }
 
-DEFAULT_WEIGHTS = {"value": 1.0, "momentum": 1.0, "capital_flow": 1.0}
+# ``volume`` defaults to 0 so existing screens are unchanged until a strategy
+# (or the UI) opts into the 放量突破 factor.
+DEFAULT_WEIGHTS = {"value": 1.0, "momentum": 1.0, "capital_flow": 1.0, "volume": 0.0}
 
 
 @dataclass
@@ -50,6 +53,15 @@ class StrategySpec:
     # the return distribution scores highest.
     momentum_period: str = "today"
     momentum_direction: str = "up"
+    # Capital-flow lookback for the ``capital_flow`` factor: 'today' | '3d' |
+    # '5d' | '10d'. Multi-day uses cumulative net inflow — sustained
+    # accumulation is a far stronger tell than a single (fakeable) session.
+    capital_flow_period: str = "today"
+    # 放量突破 (volume breakout). ``breakout`` turns the factor on and triggers
+    # the per-candidate "distance to N-day high" fetch. ``volume_ratio_min``
+    # is an optional hard filter on 量比.
+    breakout: bool = False
+    volume_ratio_min: Optional[float] = None
     # Universe restriction: only keep these 6-digit codes (e.g. a concept
     # board's constituents). None = whole market.
     universe_codes: Optional[list[str]] = None
@@ -153,6 +165,8 @@ def apply_filters(df: pd.DataFrame, spec: StrategySpec) -> pd.DataFrame:
         out = out[_between(out["change_pct"], spec.change_pct_min, spec.change_pct_max)]
     if spec.turnover_min is not None or spec.turnover_max is not None:
         out = out[_between(out["turnover"], spec.turnover_min, spec.turnover_max)]
+    if spec.volume_ratio_min is not None and "volume_ratio" in out.columns:
+        out = out[out["volume_ratio"].notna() & (out["volume_ratio"] >= spec.volume_ratio_min)]
 
     return out.reset_index(drop=True)
 
@@ -228,11 +242,27 @@ def score_and_rank(
     out["score_momentum"] = _zscore(out["momentum_value"], higher_is_better=mom_higher)
     out["score_capital_flow"] = _zscore(out["main_net_inflow"], higher_is_better=True)
 
+    # volume / 放量突破 factor: blend 量比 (volume surge) with proximity to the
+    # N-day high (``near_high_pct`` is ≤0, higher = nearer the high = breaking
+    # out). Either component may be absent; we average whatever is available so
+    # the factor still works on a today-only screen (量比 alone) or when the
+    # breakout history fetch is skipped.
+    vol_parts = []
+    if "volume_ratio" in out.columns and out["volume_ratio"].notna().any():
+        vol_parts.append(_zscore(out["volume_ratio"], higher_is_better=True))
+    if "near_high_pct" in out.columns and out["near_high_pct"].notna().any():
+        vol_parts.append(_zscore(out["near_high_pct"], higher_is_better=True))
+    if vol_parts:
+        out["score_volume"] = sum(vol_parts) / len(vol_parts)
+    else:
+        out["score_volume"] = 0.0
+
     wsum = sum(abs(w) for w in weights.values()) or 1.0
     out["score"] = (
         weights.get("value", 0) * out["score_value"]
         + weights.get("momentum", 0) * out["score_momentum"]
         + weights.get("capital_flow", 0) * out["score_capital_flow"]
+        + weights.get("volume", 0) * out["score_volume"]
     ) / wsum
     out["score_raw"] = out["score"].round(4)
 
@@ -286,6 +316,8 @@ def to_candidates(df: pd.DataFrame, momentum_direction: str = "up") -> list[dict
             "market_cap": _f(r.get("market_cap")),
             "turnover": _f(r.get("turnover")),
             "main_net_inflow": _f(r.get("main_net_inflow")),
+            "volume_ratio": _f(r.get("volume_ratio")),
+            "near_high_pct": _f(r.get("near_high_pct")),
         }
         signal = action_signal(
             code=str(r["code"]), name=r.get("name"),
@@ -310,6 +342,7 @@ def to_candidates(df: pd.DataFrame, momentum_direction: str = "up") -> list[dict
                 "value": _f(r.get("score_value")),
                 "momentum": _f(r.get("score_momentum")),
                 "capital_flow": _f(r.get("score_capital_flow")),
+                "volume": _f(r.get("score_volume")),
             },
             "signal": signal,
             "source": "akshare/eastmoney",

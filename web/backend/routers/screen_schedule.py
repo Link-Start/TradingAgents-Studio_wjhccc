@@ -39,14 +39,30 @@ def _sub_config(req: ScreenScheduleCreate) -> dict:
     }
 
 
+# A-share closes ~15:00; intra-session snapshots (资金流/涨幅/量比) are noisy
+# and shift into the close, so a screen should run AFTER the close for stable
+# data. This is the default when the caller doesn't specify a time.
+POST_CLOSE_DEFAULT = "15:30"
+
+
+def _is_intra_market(hhmm: str) -> bool:
+    try:
+        hh, mm = (int(x) for x in hhmm.split(":"))
+    except (ValueError, AttributeError):
+        return False
+    t = hh * 60 + mm
+    return 9 * 60 + 30 <= t <= 15 * 60  # 09:30–15:00
+
+
 def _validate(req) -> None:
     if getattr(req, "schedule_type", None) not in ("daily", "weekly"):
         raise HTTPException(
             status_code=400,
             detail="schedule_type must be 'daily' | 'weekly' (screens rotate slowly)",
         )
+    # time_of_day now optional — default to post-close (better data) when blank.
     if not req.time_of_day:
-        raise HTTPException(status_code=400, detail="time_of_day (HH:MM) is required")
+        req.time_of_day = POST_CLOSE_DEFAULT
     if req.schedule_type == "weekly" and (
         req.day_of_week is None or not (0 <= req.day_of_week <= 6)
     ):
@@ -112,6 +128,11 @@ async def create(req: ScreenScheduleCreate):
             next_run_at=next_run,
         ),
     )
+    # Soft heads-up (not an error): screening intra-session gives noisy, shifting
+    # data. The schedule is still created — we just flag it.
+    if req.asset_type != "crypto" and _is_intra_market(req.time_of_day):
+        row["warning"] = (f"选股时间 {req.time_of_day} 在盘中，资金流/涨幅/量比会随盘波动，"
+                          f"建议设为盘后(如 {POST_CLOSE_DEFAULT})以获得稳定数据。")
     return row
 
 
