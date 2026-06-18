@@ -73,6 +73,23 @@
             <n-form-item :label="t('screener.sector')" label-placement="top">
               <n-input v-model:value="filters.sector_query" clearable style="width: 160px" />
             </n-form-item>
+            <n-form-item :label="t('screener.capitalFlowPeriod')" label-placement="top">
+              <n-select v-model:value="capitalFlowPeriod" :options="flowPeriodOptions"
+                clearable size="small" style="width: 150px"
+                :placeholder="t('screener.flowToday')" />
+            </n-form-item>
+            <n-form-item :label="t('screener.volumeRatioMin')" label-placement="top">
+              <n-input-number v-model:value="filters.volume_ratio_min" :min="0" :step="0.5"
+                clearable style="width: 130px" />
+            </n-form-item>
+            <n-form-item :label="t('screener.breakout')" label-placement="top">
+              <n-tooltip>
+                <template #trigger>
+                  <n-checkbox v-model:checked="breakout">{{ t('screener.breakoutOn') }}</n-checkbox>
+                </template>
+                {{ t('screener.breakoutHint') }}
+              </n-tooltip>
+            </n-form-item>
           </n-space>
         </n-collapse-item>
       </n-collapse>
@@ -294,7 +311,18 @@ const momentumDirection = ref('up')
 const buyableOnly = ref(false)
 const filters = reactive<Record<string, any>>({
   pe_max: null, pb_max: null, market_cap_min: null, market_cap_max: null, sector_query: null,
+  volume_ratio_min: null,
 })
+// 放量突破 toggle + 资金流周期 (kept as standalone refs like mainBoardOnly).
+const breakout = ref(false)
+const capitalFlowPeriod = ref<string | null>(null)
+
+const flowPeriodOptions = computed(() => [
+  { label: t('screener.flowToday'), value: 'today' },
+  { label: t('screener.flow3d'), value: '3d' },
+  { label: t('screener.flow5d'), value: '5d' },
+  { label: t('screener.flow10d'), value: '10d' },
+])
 
 const periodOptions = computed(() => [
   { label: t('screener.periodToday'), value: 'today' },
@@ -352,6 +380,8 @@ function cleanFilters(): Record<string, any> {
   out.momentum_direction = momentumDirection.value
   if (mainBoardOnly.value) out.main_board_only = true
   if (buyableOnly.value) out.buyable_only = true
+  if (breakout.value) out.breakout = true
+  if (capitalFlowPeriod.value) out.capital_flow_period = capitalFlowPeriod.value
   return out
 }
 
@@ -456,12 +486,33 @@ const columns = computed<any[]>(() => [
   { title: t('screener.columns.marketCap'), key: 'mc', width: 90, render: (r: any) => fmt(r.metrics?.market_cap, 0) },
   { title: t('screener.columns.turnover'), key: 'turnover', width: 80, render: (r: any) => fmt(r.metrics?.turnover) },
   {
+    title: t('screener.columns.volumeRatio'), key: 'volume_ratio', width: 80,
+    render: (r: any) => {
+      const v = r.metrics?.volume_ratio
+      if (v == null) return '-'
+      // 量比 > 2 ≈ 明显放量 → 标红强调
+      return h(NText, { type: v >= 2 ? 'error' : 'default' }, () => fmt(v))
+    },
+  },
+  {
+    title: t('screener.columns.nearHigh'), key: 'near_high_pct', width: 90,
+    render: (r: any) => {
+      const v = r.metrics?.near_high_pct
+      if (v == null) return '-'
+      // near_high_pct ≤ 0:越接近 0 越贴近20日新高(突破)→ 越接近 0 标红
+      return h(NTooltip, null, {
+        trigger: () => h(NText, { type: v >= -2 ? 'error' : 'default' }, () => fmt(v) + '%'),
+        default: () => t('screener.nearHighHint'),
+      })
+    },
+  },
+  {
     title: t('screener.columns.score'), key: 'score', width: 90,
     render: (r: any) => h(NTooltip, null, {
       trigger: () => h(NTag, { size: 'small', type: 'info', bordered: false }, () => fmt(r.score)),
       default: () => {
         const fb = r.factor_breakdown || {}
-        return `${t('screener.value')}: ${fmt(fb.value)} · ${t('screener.momentum')}: ${fmt(fb.momentum)} · ${t('screener.capitalFlow')}: ${fmt(fb.capital_flow)}`
+        return `${t('screener.value')}: ${fmt(fb.value)} · ${t('screener.momentum')}: ${fmt(fb.momentum)} · ${t('screener.capitalFlow')}: ${fmt(fb.capital_flow)} · ${t('screener.volume')}: ${fmt(fb.volume)}`
       },
     }),
   },
