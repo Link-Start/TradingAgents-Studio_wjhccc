@@ -233,6 +233,9 @@
             </n-radio-group>
             <n-time-picker v-model:formatted-value="saveScreenTime" format="HH:mm" value-format="HH:mm" />
           </n-space>
+          <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
+            {{ t('screenSchedule.postCloseHint') }}
+          </n-text>
         </n-form-item>
         <n-form-item :label="t('screenSchedule.fields.subCadence')" label-placement="top">
           <n-space align="center">
@@ -691,10 +694,13 @@ const showSaveScreen = ref(false)
 const savingScreen = ref(false)
 const saveScreenGoal = ref('')
 const saveScreenType = ref<'daily' | 'weekly'>('daily')
-const saveScreenTime = ref<string | null>('09:20')
+// Post-close defaults: A-share closes 15:00, so 15:30 is when today's volume /
+// capital-flow / change data has settled — screen then, run the deep analysis
+// right after (15:40), and the user reviews the picks before next open.
+const saveScreenTime = ref<string | null>('15:30')
 const saveSubType = ref<'interval' | 'daily'>('daily')
 const saveSubInterval = ref(60)
-const saveSubTime = ref<string | null>('09:35')
+const saveSubTime = ref<string | null>('15:40')
 const saveEvictAfter = ref(3)
 
 watch(showSaveScreen, (open) => {
@@ -714,10 +720,10 @@ async function confirmSaveScreen() {
       top_n: topN.value,
       use_llm: useLlm.value,
       schedule_type: saveScreenType.value,
-      time_of_day: saveScreenTime.value || '09:20',
+      time_of_day: saveScreenTime.value || '15:30',
       sub_schedule_type: saveSubType.value,
       sub_interval_minutes: saveSubType.value === 'interval' ? saveSubInterval.value : null,
-      sub_time_of_day: saveSubType.value !== 'interval' ? (saveSubTime.value || '09:35') : null,
+      sub_time_of_day: saveSubType.value !== 'interval' ? (saveSubTime.value || '15:40') : null,
       evict_after_misses: saveEvictAfter.value,
     })
     showSaveScreen.value = false
