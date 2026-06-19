@@ -17,6 +17,19 @@
           {{ running ? t('screener.running') : t('screener.start') }}
         </n-button>
       </n-input-group>
+      <!-- One-click recommended preset for users who don't want to tune knobs -->
+      <n-space style="margin-top: 12px" :size="10" align="center">
+        <n-tooltip>
+          <template #trigger>
+            <n-button type="success" strong @click="applyRecommended">
+              ⭐ {{ t('screener.recommend.btn') }}
+            </n-button>
+          </template>
+          {{ t('screener.recommend.hint') }}
+        </n-tooltip>
+        <n-text depth="3" style="font-size: 12px">{{ t('screener.recommend.desc') }}</n-text>
+      </n-space>
+
       <!-- Strategy mode presets: each sets momentum direction + buyable filter -->
       <n-space style="margin-top: 10px" :size="8" align="center">
         <n-text depth="3" strong>{{ t('screener.modeLabel') }}:</n-text>
@@ -351,6 +364,21 @@ function setMode(m: string) {
   if (m === 'strong') { momentumDirection.value = 'up'; buyableOnly.value = false }
   else if (m === 'buyable') { momentumDirection.value = 'up'; buyableOnly.value = true }
   else if (m === 'oversold') { momentumDirection.value = 'down'; buyableOnly.value = false }
+}
+
+// One-click "抓启动" preset for users who don't want to tune knobs. Intent:
+// main capital flowing in for 5 days + breaking out on volume + not yet
+// over-extended + still enterable next session. NOT a guarantee — just a
+// higher-odds starting combo the user can run as-is.
+function applyRecommended() {
+  setMode('buyable')             // 只看可买入(剔除涨停/高位/杀跌)
+  momentumPeriod.value = '5d'    // 近一周动量:刚启动、涨幅还不大
+  breakout.value = true          // 放量突破:量比 + 接近20日新高
+  capitalFlowPeriod.value = '5d' // 主力近5日持续净流入
+  mainBoardOnly.value = true     // 普通账户可交易的沪深主板
+  topN.value = 20
+  if (!goal.value.trim()) goal.value = t('screener.recommend.goal')
+  message.success(t('screener.recommend.applied'))
 }
 
 const running = ref(false)

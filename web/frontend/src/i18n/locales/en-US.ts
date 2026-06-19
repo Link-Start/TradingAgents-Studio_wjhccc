@@ -85,6 +85,13 @@ export default {
     buyableOnly: 'Enterable only',
     buyableOnlyHint: 'Drop names already at the daily limit, over-extended, or crashing — keep only stocks you can realistically still buy next session, each with a buy/sell plan.',
     modeLabel: 'Mode',
+    recommend: {
+      btn: 'Recommended: catch breakouts',
+      hint: 'Not sure how to tune? Click this: auto-configures "buyable-only + volume breakout + 5-day sustained inflow + 1-week momentum". Then just run.',
+      desc: 'For beginners — one click fills in the parameters, no manual setup',
+      goal: 'Sustained inflow, breaking out on volume, not yet over-extended, still buyable',
+      applied: 'Recommended preset applied — click "Start" to screen',
+    },
     modeStrong: '🔥 Chase strength',
     modeStrongHint: 'Rank by today\'s gain, limit-ups included (momentum/chase view). Still flags which are sealed and hard to buy next day.',
     modeBuyable: '✅ Enterable only',
