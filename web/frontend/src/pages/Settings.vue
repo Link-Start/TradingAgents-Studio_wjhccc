@@ -137,9 +137,12 @@
             <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
           </n-form-item>
         </n-form>
-        <n-button type="primary" secondary :loading="savingRisk" @click="saveRisk">
-          {{ t('settings.risk.saveBtn') }}
-        </n-button>
+        <n-space>
+          <n-button secondary @click="fillRecommended">{{ t('settings.risk.fillRecommended') }}</n-button>
+          <n-button type="primary" secondary :loading="savingRisk" @click="saveRisk">
+            {{ t('settings.risk.saveBtn') }}
+          </n-button>
+        </n-space>
       </n-card>
 
       <n-card :title="t('settings.dirCard')" style="margin-top: 16px" size="small">
@@ -356,6 +359,19 @@ async function fetchRisk() {
     riskForm.paper_daily_loss_limit_pct = data.paper_daily_loss_limit_pct ?? 0
     riskForm.buys_halted_today = !!data.buys_halted_today
   } catch { /* non-fatal */ }
+}
+
+// Recommended starting values (中短线常见区间, 仅供参考). Fills the form only —
+// the user still reviews and clicks save, so risk controls are never silently
+// enabled. Percent fields hold fractions; the *UI proxies show whole percents.
+function fillRecommended() {
+  riskForm.daily_token_budget = 2000000
+  riskForm.paper_stop_pct = 0.08
+  riskForm.paper_take_profit_pct = 0.20
+  riskForm.paper_max_positions = 10
+  riskForm.paper_max_position_pct = 0.20
+  riskForm.paper_daily_loss_limit_pct = 0.05
+  message.info(t('settings.risk.filledHint'))
 }
 
 async function saveRisk() {

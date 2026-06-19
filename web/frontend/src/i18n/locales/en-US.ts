@@ -909,6 +909,8 @@ export default {
       zeroOff: '0 = off',
       halted: 'Daily-loss breaker tripped · buys halted',
       saveBtn: 'Save risk settings',
+      fillRecommended: 'Fill recommended',
+      filledHint: 'Recommended values filled (for reference) — review, then save',
     },
   },
 

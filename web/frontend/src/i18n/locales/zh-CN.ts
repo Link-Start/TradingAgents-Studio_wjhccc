@@ -909,6 +909,8 @@ export default {
       zeroOff: '0=关闭',
       halted: '今日已触发亏损熔断·暂停买入',
       saveBtn: '保存风控设置',
+      fillRecommended: '填入推荐值',
+      filledHint: '已填入推荐值(仅供参考),请确认后再点保存',
     },
   },
 
