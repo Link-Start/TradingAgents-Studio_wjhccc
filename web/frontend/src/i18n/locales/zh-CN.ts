@@ -895,6 +895,21 @@ export default {
     dbBackend: '数据库',
     saveBtn: '保存设置',
     saved: '设置已保存',
+    riskCard: '风控与预算',
+    risk: {
+      desc: '这些是业务策略阈值,保存后立即生效并持久化到数据库(重启不丢)。填 0 表示关闭该项。',
+      dailyTokenBudget: '每日 Token 预算',
+      dailyTokenHint: '当日用量达上限后,定时分析暂停至次日;0=不限',
+      unlimited: '0=不限',
+      stopPct: '自动止损',
+      takeProfitPct: '自动止盈',
+      maxPositions: '最大持仓数',
+      maxPositionPct: '单票最大占比',
+      dailyLossLimitPct: '单日亏损熔断',
+      zeroOff: '0=关闭',
+      halted: '今日已触发亏损熔断·暂停买入',
+      saveBtn: '保存风控设置',
+    },
   },
 
   debate: {

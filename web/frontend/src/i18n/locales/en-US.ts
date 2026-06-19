@@ -895,6 +895,21 @@ export default {
     dbBackend: 'Database',
     saveBtn: 'Save settings',
     saved: 'Settings saved',
+    riskCard: 'Risk & budget',
+    risk: {
+      desc: 'Business strategy thresholds. Saved live and persisted to the DB (survives restart). 0 disables a guard.',
+      dailyTokenBudget: 'Daily token budget',
+      dailyTokenHint: 'Pauses scheduled analyses until next day when reached; 0 = unlimited',
+      unlimited: '0 = unlimited',
+      stopPct: 'Auto stop-loss',
+      takeProfitPct: 'Auto take-profit',
+      maxPositions: 'Max positions',
+      maxPositionPct: 'Max single position',
+      dailyLossLimitPct: 'Daily loss breaker',
+      zeroOff: '0 = off',
+      halted: 'Daily-loss breaker tripped · buys halted',
+      saveBtn: 'Save risk settings',
+    },
   },
 
   debate: {

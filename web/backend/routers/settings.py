@@ -8,7 +8,7 @@ from tradingagents.default_config import DEFAULT_CONFIG, _ENV_OVERRIDES, _apply_
 from tradingagents.llm_clients.api_key_env import PROVIDER_API_KEY_ENV
 from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from .. import database as db
-from ..models import SettingsUpdate, APIKeysUpdate
+from ..models import SettingsUpdate, APIKeysUpdate, RiskSettingsUpdate
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -227,3 +227,58 @@ async def update_api_keys(req: APIKeysUpdate):
         )
 
     return {"ok": True, "updated": updated, "unknown": unknown}
+
+
+# --- Risk-control / budget settings --------------------------------------
+#
+# These business knobs (token budget, stop-loss, position caps, …) used to be
+# env-only. They now live in the Settings page: persisted to the DB and mirrored
+# into os.environ, which scheduler.py / risk.py / dashboard.py already read live.
+# Field name → env var. ``int`` fields are stored without a decimal point.
+_RISK_FIELD_ENV: dict[str, tuple[str, type]] = {
+    "daily_token_budget":        ("TRADINGAGENTS_DAILY_TOKEN_BUDGET", int),
+    "paper_stop_pct":            ("TRADINGAGENTS_PAPER_STOP_PCT", float),
+    "paper_take_profit_pct":     ("TRADINGAGENTS_PAPER_TAKE_PROFIT_PCT", float),
+    "paper_max_positions":       ("TRADINGAGENTS_PAPER_MAX_POSITIONS", int),
+    "paper_max_position_pct":    ("TRADINGAGENTS_PAPER_MAX_POSITION_PCT", float),
+    "paper_daily_loss_limit_pct": ("TRADINGAGENTS_PAPER_DAILY_LOSS_LIMIT_PCT", float),
+    "risk_check_sec":            ("TRADINGAGENTS_RISK_CHECK_SEC", int),
+}
+
+
+def _read_risk_field(env_var: str, typ: type):
+    raw = os.environ.get(env_var)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(float(raw)) if typ is int else float(raw)
+    except ValueError:
+        return None
+
+
+@router.get("/risk-settings")
+async def get_risk_settings():
+    """Current risk/budget knobs (None = unset → that guard is off)."""
+    out = {field: _read_risk_field(env_var, typ)
+           for field, (env_var, typ) in _RISK_FIELD_ENV.items()}
+    # Surface the live daily-loss circuit-breaker state for the UI.
+    try:
+        from .. import risk
+        out["buys_halted_today"] = risk.buys_halted()
+    except Exception:  # noqa: BLE001
+        out["buys_halted_today"] = False
+    return out
+
+
+@router.put("/risk-settings")
+async def update_risk_settings(req: RiskSettingsUpdate):
+    """Persist risk/budget knobs to the DB + os.environ (live, restart-safe)."""
+    updates = req.model_dump(exclude_none=True)
+    persisted: list[str] = []
+    for field, value in updates.items():
+        env_var, typ = _RISK_FIELD_ENV[field]
+        # Coerce to the env string form: ints without a decimal, floats as-is.
+        str_val = str(int(value)) if typ is int else str(float(value))
+        _persist_env(env_var, str_val)
+        persisted.append(env_var)
+    return {"ok": True, "persisted": persisted}

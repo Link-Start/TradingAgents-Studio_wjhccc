@@ -27,6 +27,23 @@ class SettingsUpdate(BaseModel):
     benchmark_ticker: Optional[str] = None
 
 
+class RiskSettingsUpdate(BaseModel):
+    """Risk-control / budget knobs, editable from the Settings page.
+
+    All optional → only sent fields are updated. Persisted to the DB and mirrored
+    into os.environ (the scheduler / risk module read these env vars live), so a
+    change takes effect without a restart and survives container rebuilds. ``None``
+    leaves a field unchanged; sending 0 disables that specific guard.
+    """
+    daily_token_budget: Optional[int] = None       # 0 = unlimited
+    paper_stop_pct: Optional[float] = None          # e.g. 0.08 → flatten at -8%
+    paper_take_profit_pct: Optional[float] = None   # e.g. 0.20 → flatten at +20%
+    paper_max_positions: Optional[int] = None       # 0 = no cap
+    paper_max_position_pct: Optional[float] = None  # 0 = no cap
+    paper_daily_loss_limit_pct: Optional[float] = None  # 0 = no breaker
+    risk_check_sec: Optional[int] = None            # periodic check interval
+
+
 class APIKeysUpdate(BaseModel):
     """Partial map of provider name → API key value.
 

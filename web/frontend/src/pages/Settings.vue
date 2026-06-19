@@ -96,6 +96,52 @@
         </n-form>
       </n-card>
 
+      <n-card :title="t('settings.riskCard')" style="margin-top: 16px">
+        <template #header-extra>
+          <n-tag v-if="riskForm.buys_halted_today" type="error" size="small" :bordered="false">
+            {{ t('settings.risk.halted') }}
+          </n-tag>
+        </template>
+        <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 12px">
+          {{ t('settings.risk.desc') }}
+        </n-text>
+        <n-form label-placement="left" label-width="200">
+          <n-form-item :label="t('settings.risk.dailyTokenBudget')">
+            <n-input-number v-model:value="riskForm.daily_token_budget" :min="0" :step="100000"
+              style="width: 220px" :placeholder="t('settings.risk.unlimited')" />
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.dailyTokenHint') }}</n-text>
+          </n-form-item>
+          <n-form-item :label="t('settings.risk.stopPct')">
+            <n-input-number v-model:value="stopPctUI" :min="0" :max="100" :step="1"
+              style="width: 140px"><template #suffix>%</template></n-input-number>
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
+          </n-form-item>
+          <n-form-item :label="t('settings.risk.takeProfitPct')">
+            <n-input-number v-model:value="tpPctUI" :min="0" :max="1000" :step="1"
+              style="width: 140px"><template #suffix>%</template></n-input-number>
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
+          </n-form-item>
+          <n-form-item :label="t('settings.risk.maxPositions')">
+            <n-input-number v-model:value="riskForm.paper_max_positions" :min="0" :step="1"
+              style="width: 140px" />
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
+          </n-form-item>
+          <n-form-item :label="t('settings.risk.maxPositionPct')">
+            <n-input-number v-model:value="maxPosPctUI" :min="0" :max="100" :step="5"
+              style="width: 140px"><template #suffix>%</template></n-input-number>
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
+          </n-form-item>
+          <n-form-item :label="t('settings.risk.dailyLossLimitPct')">
+            <n-input-number v-model:value="dailyLossUI" :min="0" :max="100" :step="1"
+              style="width: 140px"><template #suffix>%</template></n-input-number>
+            <n-text depth="3" style="font-size: 12px; margin-left: 8px">{{ t('settings.risk.zeroOff') }}</n-text>
+          </n-form-item>
+        </n-form>
+        <n-button type="primary" secondary :loading="savingRisk" @click="saveRisk">
+          {{ t('settings.risk.saveBtn') }}
+        </n-button>
+      </n-card>
+
       <n-card :title="t('settings.dirCard')" style="margin-top: 16px" size="small">
         <n-descriptions :column="1" bordered>
           <n-descriptions-item :label="t('settings.dirCache')">{{ settings?.data_cache_dir }}</n-descriptions-item>
@@ -139,6 +185,7 @@ const message = useMessage()
 const loading = ref(true)
 const saving = ref(false)
 const savingKeys = ref(false)
+const savingRisk = ref(false)
 const clearing = ref<string | null>(null)
 const settings = computed(() => settingsStore.settings)
 
@@ -256,6 +303,7 @@ async function load() {
     settingsStore.fetch(),
     settingsStore.fetchModelCatalog(),
     fetchKeys(),
+    fetchRisk(),
   ])
   if (settingsStore.settings) {
     Object.assign(form, settingsStore.settings)
@@ -270,6 +318,63 @@ async function save() {
     message.success(t('settings.saved'))
   } finally {
     saving.value = false
+  }
+}
+
+// --- Risk / budget settings --------------------------------------------
+// Backend stores fractions (0.08); the UI edits whole percents (8). Null = unset
+// (guard off) → shown as 0 in the inputs, sent back as 0 (which disables it).
+const riskForm = reactive<Record<string, any>>({
+  daily_token_budget: 0,
+  paper_stop_pct: null,
+  paper_take_profit_pct: null,
+  paper_max_positions: 0,
+  paper_max_position_pct: null,
+  paper_daily_loss_limit_pct: null,
+  buys_halted_today: false,
+})
+
+function pctProxy(field: string) {
+  return computed<number>({
+    get: () => Math.round(((riskForm[field] ?? 0) as number) * 100),
+    set: (v: number) => { riskForm[field] = (v || 0) / 100 },
+  })
+}
+const stopPctUI = pctProxy('paper_stop_pct')
+const tpPctUI = pctProxy('paper_take_profit_pct')
+const maxPosPctUI = pctProxy('paper_max_position_pct')
+const dailyLossUI = pctProxy('paper_daily_loss_limit_pct')
+
+async function fetchRisk() {
+  try {
+    const { data } = await api.get('/api/risk-settings')
+    riskForm.daily_token_budget = data.daily_token_budget ?? 0
+    riskForm.paper_stop_pct = data.paper_stop_pct ?? 0
+    riskForm.paper_take_profit_pct = data.paper_take_profit_pct ?? 0
+    riskForm.paper_max_positions = data.paper_max_positions ?? 0
+    riskForm.paper_max_position_pct = data.paper_max_position_pct ?? 0
+    riskForm.paper_daily_loss_limit_pct = data.paper_daily_loss_limit_pct ?? 0
+    riskForm.buys_halted_today = !!data.buys_halted_today
+  } catch { /* non-fatal */ }
+}
+
+async function saveRisk() {
+  savingRisk.value = true
+  try {
+    await api.put('/api/risk-settings', {
+      daily_token_budget: Math.max(0, Math.round(riskForm.daily_token_budget || 0)),
+      paper_stop_pct: riskForm.paper_stop_pct || 0,
+      paper_take_profit_pct: riskForm.paper_take_profit_pct || 0,
+      paper_max_positions: Math.max(0, Math.round(riskForm.paper_max_positions || 0)),
+      paper_max_position_pct: riskForm.paper_max_position_pct || 0,
+      paper_daily_loss_limit_pct: riskForm.paper_daily_loss_limit_pct || 0,
+    })
+    message.success(t('settings.saved'))
+    await fetchRisk()
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  } finally {
+    savingRisk.value = false
   }
 }
 
