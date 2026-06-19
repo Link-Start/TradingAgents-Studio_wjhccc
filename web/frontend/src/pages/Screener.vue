@@ -694,13 +694,14 @@ const showSaveScreen = ref(false)
 const savingScreen = ref(false)
 const saveScreenGoal = ref('')
 const saveScreenType = ref<'daily' | 'weekly'>('daily')
-// Post-close defaults: A-share closes 15:00, so 15:30 is when today's volume /
-// capital-flow / change data has settled — screen then, run the deep analysis
-// right after (15:40), and the user reviews the picks before next open.
-const saveScreenTime = ref<string | null>('15:30')
+// Pre-open defaults. Screening at 09:15 reads the PREVIOUS session's settled
+// data (today's bar doesn't exist yet — exactly what we want), the deep analysis
+// at 09:25 then uses the freshest overnight news, and any BUY can fill at/just
+// after the 09:30 open at a real price (vs a post-close fill you could never get).
+const saveScreenTime = ref<string | null>('09:15')
 const saveSubType = ref<'interval' | 'daily'>('daily')
 const saveSubInterval = ref(60)
-const saveSubTime = ref<string | null>('15:40')
+const saveSubTime = ref<string | null>('09:25')
 const saveEvictAfter = ref(3)
 
 watch(showSaveScreen, (open) => {
@@ -720,10 +721,10 @@ async function confirmSaveScreen() {
       top_n: topN.value,
       use_llm: useLlm.value,
       schedule_type: saveScreenType.value,
-      time_of_day: saveScreenTime.value || '15:30',
+      time_of_day: saveScreenTime.value || '09:15',
       sub_schedule_type: saveSubType.value,
       sub_interval_minutes: saveSubType.value === 'interval' ? saveSubInterval.value : null,
-      sub_time_of_day: saveSubType.value !== 'interval' ? (saveSubTime.value || '15:40') : null,
+      sub_time_of_day: saveSubType.value !== 'interval' ? (saveSubTime.value || '09:25') : null,
       evict_after_misses: saveEvictAfter.value,
     })
     showSaveScreen.value = false

@@ -478,7 +478,7 @@ export default {
   screenSchedule: {
     sectionTitle: 'Screen schedules (auto-rotating pool)',
     sectionDesc: 'Periodically re-run a screen: new hits are added to scheduled analysis, names missed several times in a row are evicted; held tickers are kept and keep being analysed.',
-    postCloseHint: '💡 Use a post-close time (default 15:30): change/volume/flow data only settles after the close, so picks are most reliable — enter at the next open.',
+    postCloseHint: '💡 Use a pre-open time (default 09:15 screen / 09:25 analyze): screening pre-open reads the previous session’s settled data, analysis uses the freshest overnight news, and a BUY can fill at a real price after the 09:30 open.',
     newBtn: 'New screen schedule',
     empty: 'No screen schedules yet. Pick a strategy on the Screener page and click "Save as screen schedule", or create one here.',
     createTitle: 'New screen schedule',
