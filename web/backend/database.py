@@ -560,7 +560,9 @@ def update_analysis_status(id: str, status: str, signal: Optional[str] = None,
         fields = ["status = ?"]
         params = [status]
         if signal is not None:
-            fields.append("signal = ?")
+            # `signal` is a reserved word in MySQL — must be backtick-quoted in
+            # raw SQL or it fails with a 1064 syntax error (SQLite is lenient).
+            fields.append("`signal` = ?")
             params.append(signal)
         if confidence is not None:
             fields.append("confidence = ?")
@@ -602,7 +604,7 @@ def list_analyses(ticker: Optional[str] = None, signal: Optional[str] = None,
         conditions.append("ticker LIKE ?")
         params.append(f"%{ticker}%")
     if signal:
-        conditions.append("signal = ?")
+        conditions.append("`signal` = ?")
         params.append(signal)
     if date_from:
         conditions.append("trade_date >= ?")
@@ -614,7 +616,7 @@ def list_analyses(ticker: Optional[str] = None, signal: Optional[str] = None,
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     # List view only needs metadata — final_decision / config_json can be tens
     # of KB per row and would bloat every page of results.
-    list_cols = ("id, ticker, trade_date, asset_type, analysts, status, signal, "
+    list_cols = ("id, ticker, trade_date, asset_type, analysts, status, `signal`, "
                  "confidence, created_at, completed_at, error_msg, "
                  "tokens_in, tokens_out, llm_calls")
     with get_db() as conn:
@@ -732,7 +734,7 @@ def get_dashboard_stats() -> dict:
             "SELECT * FROM analyses ORDER BY created_at DESC LIMIT 5"
         ).fetchall()
         signal_dist = conn.execute(
-            "SELECT signal, COUNT(*) as count FROM analyses WHERE signal IS NOT NULL GROUP BY signal"
+            "SELECT `signal`, COUNT(*) as count FROM analyses WHERE `signal` IS NOT NULL GROUP BY `signal`"
         ).fetchall()
     return {
         "recent": [dict(r) for r in recent],
@@ -744,8 +746,8 @@ def get_compare(tickers: list, days: int = 30) -> list:
     placeholders = ",".join("?" * len(tickers))
     with get_db() as conn:
         rows = conn.execute(
-            f"SELECT ticker, trade_date, signal, confidence, created_at FROM analyses "
-            f"WHERE ticker IN ({placeholders}) AND signal IS NOT NULL "
+            f"SELECT ticker, trade_date, `signal`, confidence, created_at FROM analyses "
+            f"WHERE ticker IN ({placeholders}) AND `signal` IS NOT NULL "
             f"ORDER BY created_at DESC LIMIT ?",
             tickers + [days],
         ).fetchall()
@@ -857,7 +859,7 @@ def latest_signal_for_ticker(ticker: str) -> Optional[dict]:
     """Most recent complete analysis for ``ticker``, used to annotate holdings."""
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, signal, confidence, trade_date, created_at "
+            "SELECT id, `signal`, confidence, trade_date, created_at "
             "FROM analyses WHERE ticker = ? AND status = 'complete' "
             "ORDER BY created_at DESC LIMIT 1",
             (ticker,),
@@ -879,7 +881,7 @@ def latest_signals_for_tickers(tickers: list[str]) -> dict[str, dict]:
     placeholders = ",".join("?" * len(tickers))
     with get_db() as conn:
         rows = conn.execute(
-            f"SELECT a.id, a.ticker, a.signal, a.confidence, a.trade_date, a.created_at "
+            f"SELECT a.id, a.ticker, a.`signal`, a.confidence, a.trade_date, a.created_at "
             f"FROM analyses a "
             f"JOIN (SELECT ticker, MAX(created_at) AS max_created "
             f"      FROM analyses WHERE status = 'complete' AND ticker IN ({placeholders}) "
